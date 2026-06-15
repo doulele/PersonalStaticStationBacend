@@ -5,6 +5,7 @@ import qtRoutes from './qt.js'
 import ifzqRoutes from './ifzq.js'
 import lotteryRoutes from './lottery.js'
 import ocrRoutes from './ocr.js'
+import analysisRoutes from './analysis.js'
 
 const router = Router()
 
@@ -24,6 +25,7 @@ router.use('/qt', qtRoutes)
 router.use('/ifzq', ifzqRoutes)
 router.use('/lottery', lotteryRoutes)
 router.use('/ocr', ocrRoutes)
+router.use('/analysis', analysisRoutes)
 
 // 健康检查
 router.get('/health', (req, res) => {

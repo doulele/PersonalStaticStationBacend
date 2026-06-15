@@ -55,5 +55,8 @@ export default {
 
   // DeepSeek API Key（可选，配置后启用 LLM 智能解析彩票号码）
   // 获取地址：https://platform.deepseek.com/api_keys
-  deepseekApiKey: process.env.DEEPSEEK_API_KEY || ''
+  deepseekApiKey: process.env.DEEPSEEK_API_KEY || '',
+
+  // 彩票数据爬取密码（前端隐藏按钮使用，请修改为强密码）
+  crawlPassword: process.env.CRAWL_PASSWORD || 'lottery_sync_2024'
 }

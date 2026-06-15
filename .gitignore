@@ -12,6 +12,9 @@ logs/
 .vscode/
 .idea/
 
+# 彩票数据缓存（数据量大，不提交到 git）
+cache/
+
 # 系统文件
 .DS_Store
 Thumbs.db

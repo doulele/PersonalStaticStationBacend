@@ -1,5 +1,13 @@
 import { Router } from 'express'
 import { proxyRequest } from '../services/httpProxy.js'
+import {
+  fetchRecentFromAPI,
+  crawlFrom500,
+  readCache,
+  writeCache,
+  mergeData,
+  getCacheStats
+} from '../services/lotteryCrawler.js'
 import config from '../config/index.js'
 
 const router = Router()
@@ -170,6 +178,155 @@ router.post('/history', async (req, res, next) => {
   } catch (err) {
     next(err)
   }
+})
+
+// ==================== 数据同步相关接口 ====================
+
+/**
+ * GET /lottery/base-data/:type
+ * 获取缓存的彩票基础数据（type = ssq | dlt）
+ * 无需密码，前端加载时自动调用
+ */
+router.get('/base-data/:type', (req, res) => {
+  const { type } = req.params
+  if (!['ssq', 'dlt'].includes(type)) {
+    return res.json({ code: -1, msg: '类型无效，仅支持 ssq / dlt', data: null })
+  }
+
+  const data = readCache(type)
+  if (!data) {
+    return res.json({ code: -1, msg: `暂无 ${type} 缓存数据，请先运行爬取脚本`, data: null })
+  }
+
+  console.log(`[lottery/base-data] 返回 ${type} 缓存数据，共 ${data.length} 条`)
+  res.json({ code: 1, msg: 'ok', data })
+})
+
+/**
+ * GET /lottery/stats
+ * 获取缓存统计信息（供前端显示状态）
+ */
+router.get('/stats', (req, res) => {
+  const stats = getCacheStats()
+  res.json({ code: 1, msg: 'ok', data: stats })
+})
+
+/**
+ * POST /lottery/sync-data
+ * 从 RollToolsApi 同步近期数据，合并到缓存
+ * body: { type: 'ssq'|'dlt', count: 200, password?: '' }
+ * 注意：普通同步无需密码（调用第三方 API 获取最近数据）
+ */
+router.post('/sync-data', async (req, res, next) => {
+  try {
+    if (!hasCredentials()) {
+      return res.json({ code: -1, msg: 'RollToolsApi 密钥未配置', data: null })
+    }
+
+    const { type, count = 200 } = req.body
+    if (!['ssq', 'dlt'].includes(type)) {
+      return res.json({ code: -1, msg: '类型无效', data: null })
+    }
+
+    console.log(`[lottery/sync-data] 同步 ${type} 最近 ${count} 期...`)
+
+    // 从 RollToolsApi 获取近期数据
+    const newData = await fetchRecentFromAPI(type, Math.min(count, 300), appId, appSecret)
+
+    // 合并到缓存
+    const existing = readCache(type) || []
+    const merged = mergeData(existing, newData)
+
+    // 写回缓存
+    writeCache(type, merged)
+
+    console.log(`[lottery/sync-data] ${type} 同步完成: 新增 ${merged.length - existing.length} 条，总计 ${merged.length} 条`)
+
+    res.json({
+      code: 1,
+      msg: `同步完成，${type} 总计 ${merged.length} 期数据`,
+      data: {
+        type,
+        total: merged.length,
+        newAdded: merged.length - existing.length,
+        firstDate: merged[0]?.date,
+        lastDate: merged[merged.length - 1]?.date,
+        records: merged
+      }
+    })
+  } catch (err) {
+    next(err)
+  }
+})
+
+/**
+ * POST /lottery/sync-full
+ * 全量重新爬取（紧急恢复用，需要密码验证）
+ * body: { type: 'ssq'|'dlt'|'all', password: 'xxx' }
+ */
+router.post('/sync-full', async (req, res, next) => {
+  try {
+    const { type, password } = req.body
+
+    // 密码验证
+    if (!password || password !== config.crawlPassword) {
+      console.warn(`[lottery/sync-full] 密码验证失败`)
+      return res.json({ code: -1, msg: '密码错误，操作被拒绝', data: null })
+    }
+
+    if (!['ssq', 'dlt', 'all'].includes(type)) {
+      return res.json({ code: -1, msg: '类型无效，仅支持 ssq / dlt / all', data: null })
+    }
+
+    const types = type === 'all' ? ['ssq', 'dlt'] : [type]
+    const results = {}
+
+    for (const t of types) {
+      console.log(`[lottery/sync-full] 全量爬取 ${t}...`)
+      try {
+        const data = await crawlFrom500(t)
+        writeCache(t, data)
+
+        const cached = readCache(t)
+        results[t] = {
+          success: true,
+          count: data.length,
+          firstDate: cached?.[0]?.date,
+          lastDate: cached?.[cached.length - 1]?.date
+        }
+        console.log(`[lottery/sync-full] ${t} 爬取完成: ${data.length} 条`)
+      } catch (err) {
+        console.error(`[lottery/sync-full] ${t} 爬取失败:`, err.message)
+        results[t] = { success: false, error: err.message }
+      }
+
+      // 间隔避免被封
+      if (types.length > 1 && t !== types[types.length - 1]) {
+        await new Promise(r => setTimeout(r, 3000))
+      }
+    }
+
+    res.json({
+      code: 1,
+      msg: '全量爬取完成',
+      data: { results }
+    })
+  } catch (err) {
+    next(err)
+  }
+})
+
+/**
+ * POST /lottery/verify-password
+ * 独立密码验证接口（前端密码框验证用）
+ * body: { password: 'xxx' }
+ */
+router.post('/verify-password', (req, res) => {
+  const { password } = req.body
+  if (!password || password !== config.crawlPassword) {
+    return res.json({ code: -1, msg: '密码错误', data: { valid: false } })
+  }
+  res.json({ code: 1, msg: '验证通过', data: { valid: true } })
 })
 
 export default router
