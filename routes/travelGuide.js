@@ -54,60 +54,6 @@ function extractCoreScenicName(name) {
   return core
 }
 
-// ==================== Mock 数据 ====================
-const mockPlans = {
-  1: {
-    attraction: { id: 1, name: '故宫博物院', lat: 39.916345, lng: 116.397155 },
-    spots: [
-      { id: 101, name: '午门', lat: 39.9139, lng: 116.3970, stay_duration: 20, default_order: 1, ticket_price: 0, highlight: '故宫正门，气势恢宏的城门建筑', desc: '故宫正门，气势恢宏的城门建筑，检票入口。' },
-      { id: 102, name: '太和殿', lat: 39.9155, lng: 116.3972, stay_duration: 40, default_order: 2, ticket_price: 0, highlight: '故宫最大殿宇，皇帝登基大典举办地', desc: '故宫最大的宫殿，皇帝登基、大婚等重大典礼的举办地。' },
-      { id: 103, name: '中和殿', lat: 39.9160, lng: 116.3973, stay_duration: 15, default_order: 3, ticket_price: 0, highlight: '皇帝前往太和殿前休憩之所', desc: '皇帝前往太和殿前休息和准备的地方。' },
-      { id: 104, name: '保和殿', lat: 39.9165, lng: 116.3974, stay_duration: 20, default_order: 4, ticket_price: 0, highlight: '清代殿试场所，皇家最高学府', desc: '清代殿试的举办场所，建筑精美。' },
-      { id: 105, name: '乾清宫', lat: 39.9180, lng: 116.3975, stay_duration: 30, default_order: 5, ticket_price: 0, highlight: '正大光明匾所在地', desc: '明代和清初皇帝的寝宫，正大光明匾所在地。' },
-      { id: 106, name: '交泰殿', lat: 39.9185, lng: 116.3976, stay_duration: 15, default_order: 6, ticket_price: 0, highlight: '皇后接受朝贺的宫殿', desc: '皇后生日接受朝贺的地方。' },
-      { id: 107, name: '坤宁宫', lat: 39.9190, lng: 116.3977, stay_duration: 20, default_order: 7, ticket_price: 0, highlight: '皇后寝宫，清代祭祀重地', desc: '皇后的寝宫，清代改为祭祀场所。' },
-      { id: 108, name: '御花园', lat: 39.9198, lng: 116.3975, stay_duration: 40, default_order: 8, ticket_price: 0, highlight: '600年古树参天的皇家园林', desc: '皇家园林，古树参天，亭台楼阁错落有致。' },
-      { id: 109, name: '神武门', lat: 39.9205, lng: 116.3973, stay_duration: 10, default_order: 9, ticket_price: 0, highlight: '故宫北门出口，可远眺景山', desc: '故宫北门，出口处，可远眺景山。' }
-    ],
-    foods: [
-      { id: 201, name: '四季民福烤鸭店', recommend_dish: '北京烤鸭', lat: 39.9148, lng: 116.4035, price_per_person: 150, highlight: '景观位可观东华门，故宫旁人气名店' },
-      { id: 202, name: '故宫冰窖餐厅', recommend_dish: '宫廷糕点套餐', lat: 39.9172, lng: 116.3978, price_per_person: 80, highlight: '故宫院内唯一餐厅，皇家庭院中用餐' },
-      { id: 203, name: '老北京炸酱面大王', recommend_dish: '炸酱面', lat: 39.9200, lng: 116.4000, price_per_person: 45, highlight: '三代传承，地道京味炸酱面' },
-      { id: 204, name: '护国寺小吃', recommend_dish: '豆汁焦圈', lat: 39.9215, lng: 116.3985, price_per_person: 30, highlight: '老北京传统小吃集合，品种超百种' },
-      { id: 205, name: '东来顺饭庄', recommend_dish: '铜锅涮羊肉', lat: 39.9155, lng: 116.4050, price_per_person: 120, highlight: '百年老字号，手切鲜羊肉一绝' }
-    ],
-    hotels: [
-      { id: 301, name: '北京王府井希尔顿酒店', price_range: '800-1500元/晚', lat: 39.9180, lng: 116.4100, highlight: '步行10分钟直达故宫东华门' },
-      { id: 302, name: '北京饭店', price_range: '600-1200元/晚', lat: 39.9120, lng: 116.4080, highlight: '百年传奇酒店，长安街核心位置' },
-      { id: 303, name: '如家精选(故宫店)', price_range: '300-500元/晚', lat: 39.9205, lng: 116.4040, highlight: '性价比之选，步行可达神武门' },
-      { id: 304, name: '景山花园酒店', price_range: '500-800元/晚', lat: 39.9220, lng: 116.3990, highlight: '紧邻景山公园，屋顶可观故宫全景' }
-    ]
-  },
-  2: {
-    attraction: { id: 2, name: '上海迪士尼乐园', lat: 31.1444, lng: 121.6608 },
-    spots: [
-      { id: 401, name: '米奇大街', lat: 31.1430, lng: 121.6585, stay_duration: 30, default_order: 1, ticket_price: 0, highlight: '入园首站，米奇米妮合影打卡点', desc: '入园第一站，购物和拍照的好地方，米奇米妮见面点。' },
-      { id: 402, name: '探险岛', lat: 31.1445, lng: 121.6600, stay_duration: 60, default_order: 2, ticket_price: 0, highlight: '翱翔·飞越地平线，排队必玩项目', desc: '翱翔·飞越地平线、雷鸣山漂流等热门项目所在地。' },
-      { id: 403, name: '宝藏湾', lat: 31.1450, lng: 121.6615, stay_duration: 50, default_order: 3, ticket_price: 0, highlight: '加勒比海盗主题，沉落宝藏之战', desc: '加勒比海盗主题区，沉落宝藏之战不容错过。' },
-      { id: 404, name: '梦幻世界', lat: 31.1440, lng: 121.6620, stay_duration: 70, default_order: 4, ticket_price: 0, highlight: '七个小矮人矿山车，全家欢乐', desc: '七个小矮人矿山车、小飞侠天空奇遇等家庭项目。' },
-      { id: 405, name: '明日世界', lat: 31.1435, lng: 121.6630, stay_duration: 50, default_order: 5, ticket_price: 0, highlight: '创极速光轮，科技感爆棚', desc: '创极速光轮、巴斯光年星际营救等科技感十足的项目。' },
-      { id: 406, name: '奇想花园', lat: 31.1425, lng: 121.6595, stay_duration: 40, default_order: 6, ticket_price: 0, highlight: '旋转木马+夜晚烟花最佳观赏区', desc: '旋转木马、小飞象，夜晚烟花秀最佳观赏区域。' }
-    ],
-    foods: [
-      { id: 501, name: '皇家宴会厅', recommend_dish: '公主主题套餐', lat: 31.1430, lng: 121.6590, price_per_person: 350, highlight: '城堡内用餐，与迪士尼公主合影' },
-      { id: 502, name: '巴波萨烧烤', recommend_dish: '烤猪肋排', lat: 31.1450, lng: 121.6615, price_per_person: 100, highlight: '海盗主题餐厅，氛围感满分' },
-      { id: 503, name: '部落丰盛堂', recommend_dish: '火鸡腿饭', lat: 31.1445, lng: 121.6600, price_per_person: 85, highlight: '迪士尼招牌火鸡腿，排队也要吃' },
-      { id: 504, name: '米奇好伙伴美味集市', recommend_dish: '米奇头披萨', lat: 31.1430, lng: 121.6585, price_per_person: 90, highlight: '米奇造型美食，拍照出片率100%' },
-      { id: 505, name: '星露台餐厅', recommend_dish: '芝士牛肉汉堡', lat: 31.1435, lng: 121.6630, price_per_person: 80, highlight: '科幻主题餐厅，汉堡配薯条经典组合' }
-    ],
-    hotels: [
-      { id: 601, name: '上海迪士尼乐园酒店', price_range: '2000-4000元/晚', lat: 31.1400, lng: 121.6650, highlight: '梦幻城堡酒店，专属入园通道' },
-      { id: 602, name: '玩具总动员酒店', price_range: '800-1500元/晚', lat: 31.1390, lng: 121.6640, highlight: '巴斯光年主题，亲子家庭首选' },
-      { id: 603, name: '上海邻家美利亚酒店', price_range: '600-1200元/晚', lat: 31.1410, lng: 121.6580, highlight: '步行5分钟入园，性价比超高' }
-    ]
-  }
-}
-
 // ==================== API 路由 ====================
 
 /**
@@ -836,7 +782,7 @@ function haversineDistance(lat1, lng1, lat2, lng2) {
 
 /**
  * GET /travel/search
- * 搜索景点（真实高德 POI 搜索，无结果时回退 Mock）
+ * 搜索景点（真实高德 POI 搜索）
  */
 router.get('/search', async (req, res) => {
   const { keyword, city } = req.query
@@ -845,119 +791,11 @@ router.get('/search', async (req, res) => {
   }
   try {
     const pois = await searchPOI(keyword.trim(), city || undefined)
-
-    // 给已知目的地打 mockId 标签
-    const results = pois.map(poi => {
-      let mockId = null
-      if (poi.name.includes('故宫')) mockId = 1
-      else if (poi.name.includes('迪士尼')) mockId = 2
-      else if (poi.name.includes('花果山')) mockId = 21
-      else if (poi.name.includes('连岛')) mockId = 22
-      return { ...poi, mockId }
-    })
-
-    // 高德无结果时回退 Mock
-    if (results.length === 0) {
-      const kw = keyword.trim().toLowerCase()
-      const mockFallback = Object.values(mockPlans)
-        .map(p => ({ ...p.attraction, mockId: p.attraction.id }))
-        .filter(a => a.name.toLowerCase().includes(kw))
-      return res.json({ success: true, data: mockFallback, source: 'mock' })
-    }
-
-    res.json({ success: true, data: results, source: 'amap' })
+    res.json({ success: true, data: pois, source: 'amap' })
   } catch (err) {
     console.error('[Travel] 搜索失败:', err.message)
-    const kw = keyword.trim().toLowerCase()
-    const results = Object.values(mockPlans)
-      .map(p => ({ ...p.attraction, mockId: p.attraction.id }))
-      .filter(a => a.name.toLowerCase().includes(kw))
-    res.json({ success: true, data: results, source: 'mock-fallback' })
+    res.status(500).json({ success: false, error: '搜索失败，请稍后重试' })
   }
-})
-
-/**
- * GET /travel/:id/plan
- * 获取全量规划数据（Mock）
- */
-router.get('/:id/plan', (req, res) => {
-  const data = mockPlans[req.params.id]
-  if (!data) return res.status(404).json({ error: '景点数据不存在' })
-  res.json({ success: true, data })
-})
-
-/**
- * POST /travel/generate
- * 生成攻略
- */
-router.post('/generate', (req, res) => {
-  const { attractionId, selectedSpotIds, selectedFoodIds, hotelId, customHotelName } = req.body
-  const data = mockPlans[attractionId]
-  if (!data) return res.status(404).json({ error: '景点数据不存在' })
-
-  const orderedSpots = (selectedSpotIds || [])
-    .map(id => data.spots.find(s => s.id === id))
-    .filter(Boolean)
-  const selectedFoods = (selectedFoodIds || [])
-    .map(id => data.foods.find(f => f.id === id))
-    .filter(Boolean)
-  let hotelName = customHotelName || ''
-  if (Number(hotelId) > 0) {
-    const h = data.hotels.find(h => h.id === Number(hotelId))
-    if (h) hotelName = h.name
-  }
-
-  const foodBudget = selectedFoods.reduce((s, f) => s + (f.price_per_person || 0), 0)
-  const formatTime = (m) => `${String(Math.floor(m / 60)).padStart(2, '0')}:${String(m % 60).padStart(2, '0')}`
-
-  const timeline = []
-  let t = 480
-
-  if (orderedSpots.length) {
-    const half = Math.ceil(orderedSpots.length / 2)
-    timeline.push({ type: 'section', title: '🎯 上午行程' })
-    orderedSpots.slice(0, half).forEach(s => {
-      timeline.push({ type: 'spot', time: formatTime(t), data: s })
-      t += s.stay_duration
-    })
-    t += 15
-  }
-  if (selectedFoods.length) {
-    t = Math.max(t, 690)
-    timeline.push({ type: 'section', title: '🍽️ 午餐推荐' })
-    timeline.push({ type: 'food', time: formatTime(t), data: selectedFoods[0] })
-    t += 60
-  }
-  if (orderedSpots.length > 1) {
-    const half = Math.ceil(orderedSpots.length / 2)
-    timeline.push({ type: 'section', title: '🚶 下午行程' })
-    orderedSpots.slice(half).forEach(s => {
-      timeline.push({ type: 'spot', time: formatTime(t), data: s })
-      t += s.stay_duration
-    })
-    t += 15
-  }
-  if (selectedFoods.length > 1) {
-    t = Math.max(t, 1050)
-    timeline.push({ type: 'section', title: '🍲 晚餐推荐' })
-    timeline.push({ type: 'food', time: formatTime(t), data: selectedFoods[1] })
-  }
-  timeline.push({ type: 'section', title: '🏨 住宿安排' })
-  timeline.push({ type: 'hotel', time: '21:00', data: { name: hotelName } })
-
-  res.json({
-    success: true,
-    data: {
-      attractionName: data.attraction.name,
-      timeline,
-      summary: {
-        spotsCount: orderedSpots.length,
-        foodsCount: selectedFoods.length,
-        hotelName,
-        totalBudget: foodBudget
-      }
-    }
-  })
 })
 
 /**
