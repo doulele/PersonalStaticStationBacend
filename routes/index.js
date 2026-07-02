@@ -7,6 +7,7 @@ import lotteryRoutes from './lottery.js'
 import ocrRoutes from './ocr.js'
 import analysisRoutes from './analysis.js'
 import travelGuideRoutes from './travelGuide.js'
+import userRoutes from './user.js'
 
 const router = Router()
 
@@ -28,6 +29,7 @@ router.use('/lottery', lotteryRoutes)
 router.use('/ocr', ocrRoutes)
 router.use('/analysis', analysisRoutes)
 router.use('/travel', travelGuideRoutes)
+router.use('/user', userRoutes)
 
 // 健康检查
 router.get('/health', (req, res) => {

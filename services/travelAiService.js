@@ -10,9 +10,16 @@ const DEEPSEEK_API = 'https://api.deepseek.com/chat/completions'
 const SYSTEM_PROMPT = `你是一个资深的旅游规划专家。用户会给你一个旅游目的地的信息和可选项目（路线节点、美食、酒店），你需要根据专业知识推荐最佳选择。
 
 ## 你的任务
-1. 根据目的地特点，从可选路线节点中精选并排序（考虑游览逻辑、距离、时间效率）
-2. 从可选美食中推荐最值得尝试的餐厅（考虑特色、性价比、位置便利性）
-3. 从可选酒店中推荐最合适的住宿（考虑位置、性价比、舒适度）
+1. 根据目的地特点，从可选路线节点中精选并按最优游览顺序排列（考虑地理空间顺序、游览逻辑、时间效率）
+2. 为每个景点推荐合理的停留时长（stayDuration，单位分钟：小型景点15-30，中型30-60，大型60-120）
+3. 规划用餐时机：确保午餐在11:00-13:30之间，晚餐在17:00-19:30之间
+4. 从可选美食中推荐最值得尝试的餐厅（考虑特色、性价比、位置便利性），推荐2-4家
+5. 从可选酒店中推荐最合适的住宿（考虑位置、性价比、舒适度）
+
+## 行程模式
+酒店(起点) → 景点 → 景点 → 美食(午餐) → 景点 → 景点 → 美食(晚餐) → 酒店(终点)
+- 上午约2-3个景点，午餐后下午1-2个景点
+- 景点之间考虑地理邻近性，避免折返
 
 ## 输出格式（严格 JSON，不要 markdown 包裹）
 {
@@ -23,14 +30,17 @@ const SYSTEM_PROMPT = `你是一个资深的旅游规划专家。用户会给你
   "spotNotes": { "id1": "推荐理由（10字内）", "id2": "推荐理由" },
   "foodNotes": { "id1": "推荐理由（10字内）", "id2": "推荐理由" },
   "hotelNote": "推荐理由（15字内）" 或 null,
-  "timePlan": "简短的时间安排建议，如'上午游览A和B，午餐在C，下午D和E，晚住F'（50字内）"
+  "timePlan": "简短的时间安排建议，如'08:30出发，上午游览A(60分钟)和B(30分钟)，11:30午餐C，下午D(90分钟)和E(45分钟)，17:30晚餐F，19:00返回酒店'（100字内）",
+  "spotDurations": { "id1": 60, "id2": 30 },
+  "mealAssignments": { "lunch": "foodId1", "dinner": "foodId2" }
 }
 
 ## 推荐原则
 - 路线节点：按合理的游览顺序排列，考虑景点位置、开放时间和游玩时长
 - 如果节点有明显的空间顺序（如从南到北），请按最优路径排序
-- 美食：优先推荐当地特色、评分高、位置便利的餐厅，推荐1-3家即可
-- 住宿：优先推荐离景点近、性价比高的酒店
+- 景点停留时长：参考景点规模和类型（寺庙15-30分钟、小型公园30分钟、博物馆60-90分钟、大型景区90-120分钟）
+- 美食：优先推荐当地特色、评分高、位置便利的餐厅
+- 住宿：优先推荐离最后一个景点近、性价比高的酒店
 - 所有推荐都必须来自用户提供的可选列表，不要编造`
 
 
@@ -217,6 +227,8 @@ function validateResult(parsed, inputData) {
     spotNotes,
     foodNotes,
     hotelNote: parsed.hotelNote ? String(parsed.hotelNote).slice(0, 50) : null,
-    timePlan: parsed.timePlan ? String(parsed.timePlan).slice(0, 150) : null
+    timePlan: parsed.timePlan ? String(parsed.timePlan).slice(0, 200) : null,
+    spotDurations: parsed.spotDurations && typeof parsed.spotDurations === 'object' ? parsed.spotDurations : {},
+    mealAssignments: parsed.mealAssignments && typeof parsed.mealAssignments === 'object' ? parsed.mealAssignments : {}
   }
 }

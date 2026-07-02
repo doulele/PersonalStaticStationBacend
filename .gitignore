@@ -1,6 +1,9 @@
 # 环境变量 - 含敏感密钥，严禁提交到 git
 .env
 
+# 和风天气 JWT 私钥
+qweather_private.pem
+
 # 依赖
 node_modules/
 
