@@ -38,9 +38,42 @@ app.use(notFoundHandler)
 // 错误处理
 app.use(errorHandler)
 
-app.listen(config.port, () => {
-  console.log(`[StaticTool Backend] Server running on http://localhost:${config.port}`)
-  console.log(`[StaticTool Backend] Environment: ${process.env.NODE_ENV || 'development'}`)
-})
+import { createServer } from 'http'
+
+async function startServer() {
+  const server = createServer(app)
+
+  process.on('SIGINT', () => {
+    console.log('\n[StaticTool Backend] Shutting down...')
+    server.close(() => process.exit(0))
+  })
+
+  server.on('error', async (err) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`[StaticTool Backend] Port ${config.port} is in use, trying to free it...`)
+      const { execSync } = await import('child_process')
+      try {
+        const cmd = process.platform === 'win32'
+          ? `powershell -Command "Get-NetTCPConnection -LocalPort ${config.port} -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess | ForEach-Object { Stop-Process -Id $_ -Force }"`
+          : `lsof -ti:${config.port} | xargs kill -9`
+        execSync(cmd, { stdio: 'ignore' })
+        console.log(`[StaticTool Backend] Port ${config.port} freed, retrying...`)
+        setTimeout(() => server.listen(config.port), 500)
+      } catch {
+        console.error(`[StaticTool Backend] Could not free port ${config.port}, please manually run: npx kill-port ${config.port}`)
+        process.exit(1)
+      }
+    } else {
+      throw err
+    }
+  })
+
+  server.listen(config.port, () => {
+    console.log(`[StaticTool Backend] Server running on http://localhost:${config.port}`)
+    console.log(`[StaticTool Backend] Environment: ${process.env.NODE_ENV || 'development'}`)
+  })
+}
+
+startServer()
 
 export default app

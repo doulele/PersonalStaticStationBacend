@@ -10,6 +10,7 @@ import travelGuideRoutes from './travelGuide.js'
 import userRoutes from './user.js'
 import statsRoutes from './stats.js'
 import oilPriceRoutes from './oilPrice.js'
+import familyRoutes from './family.js'
 
 const router = Router()
 
@@ -34,6 +35,7 @@ router.use('/travel', travelGuideRoutes)
 router.use('/user', userRoutes)
 router.use('/stats', statsRoutes)
 router.use('/oil-price', oilPriceRoutes)
+router.use('/family', familyRoutes)
 
 // 健康检查
 router.get('/health', (req, res) => {
