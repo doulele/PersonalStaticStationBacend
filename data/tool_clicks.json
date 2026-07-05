@@ -1,8 +1,10 @@
 {
   "/home/fund/stock-detail": 1,
   "/home/lifeServices/weather": 3,
-  "/home/fund/fund-search": 3,
+  "/home/fund/fund-search": 8,
   "/home/lifeServices/oilPrice": 4,
   "/home/fund/stock-filter": 1,
-  "/home/familyEducation/babySleep": 4
+  "/home/familyEducation/babySleep": 6,
+  "/home/fund/fund-filter": 4,
+  "/home/audioVideoImagesTools/vipVideoParse": 1
 }

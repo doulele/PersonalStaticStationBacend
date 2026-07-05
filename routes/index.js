@@ -11,6 +11,7 @@ import userRoutes from './user.js'
 import statsRoutes from './stats.js'
 import oilPriceRoutes from './oilPrice.js'
 import familyRoutes from './family.js'
+import videoParseRoutes from './videoParse.js'
 
 const router = Router()
 
@@ -36,6 +37,7 @@ router.use('/user', userRoutes)
 router.use('/stats', statsRoutes)
 router.use('/oil-price', oilPriceRoutes)
 router.use('/family', familyRoutes)
+router.use('/video-parse', videoParseRoutes)
 
 // 健康检查
 router.get('/health', (req, res) => {
