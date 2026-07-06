@@ -72,5 +72,19 @@ export default {
   voiceClonePassword: process.env.VOICE_CLONE_PASSWORD || '',
 
   // 高德地图 Web 服务 API Key（后端使用：POI搜索、地理编码等）
-  amapWebServiceKey: process.env.AMAP_WEB_SERVICE_KEY || ''
+  amapWebServiceKey: process.env.AMAP_WEB_SERVICE_KEY || '',
+
+  // yt-dlp 配置
+  ytDlp: {
+    // yt-dlp 可执行文件路径，留空则在 PATH 中查找
+    binPath: process.env.YT_DLP_PATH || 'yt-dlp',
+    // 提取超时（毫秒）
+    timeout: parseInt(process.env.YT_DLP_TIMEOUT, 10) || 60000,
+    // cookie 文件路径（可选，用于需要登录的平台）
+    cookieFile: process.env.YT_DLP_COOKIE || '',
+    // HTTP/HTTPS/SOCKS5 代理（国内服务器访问 YouTube 需要）
+    proxy: process.env.YT_DLP_PROXY || '',
+    // 是否在开发环境输出详细日志
+    verbose: process.env.NODE_ENV === 'development'
+  }
 }
