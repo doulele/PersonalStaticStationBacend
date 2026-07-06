@@ -1,13 +1,121 @@
 import { Router } from 'express'
 import axios from 'axios'
+import crypto from 'crypto'
 import { execFile, exec } from 'child_process'
 import { promisify } from 'util'
+import HttpsProxyAgent from 'https-proxy-agent'
+import { SocksProxyAgent } from 'socks-proxy-agent'
 import config from '../config/index.js'
 
 const execFileAsync = promisify(execFile)
 const execAsync = promisify(exec)
 
 const router = Router()
+
+// ==================== 搜索结果缓存 ====================
+// key: "平台:关键词" → { results, groups, ungrouped, timestamp }
+const searchCache = new Map()
+const SEARCH_CACHE_MAX = 200          // 最多缓存 200 条
+const SEARCH_CACHE_TTL = 30 * 60 * 1000 // 30 分钟
+
+function getCacheKey(platform, query) {
+  return `${platform}:${query.trim()}`
+}
+
+function getCachedSearch(platform, query) {
+  const key = getCacheKey(platform, query)
+  const entry = searchCache.get(key)
+  if (entry && Date.now() - entry.timestamp < SEARCH_CACHE_TTL) {
+    console.log(`[search cache] HIT "${key}" (${entry.results.length} results)`)
+    return entry
+  }
+  return null
+}
+
+function setCachedSearch(platform, query, data) {
+  const key = getCacheKey(platform, query)
+  // 超出最大容量时删除最旧的一半
+  if (searchCache.size >= SEARCH_CACHE_MAX) {
+    const entries = [...searchCache.entries()]
+      .sort((a, b) => a[1].timestamp - b[1].timestamp)
+    const toDelete = entries.slice(0, Math.floor(SEARCH_CACHE_MAX / 2))
+    for (const [k] of toDelete) searchCache.delete(k)
+    console.log(`[search cache] 清理 ${toDelete.length} 条过期缓存`)
+  }
+  searchCache.set(key, { ...data, timestamp: Date.now() })
+  console.log(`[search cache] SET "${key}" (${data.results.length} results)`)
+}
+
+// ==================== 流媒体代理缓存 ====================
+// token -> { streamUrl, referer, expires, needProxy }
+const streamCache = new Map()
+const STREAM_TOKEN_TTL = 10 * 60 * 1000 // 10分钟
+
+function generateToken() {
+  return crypto.randomBytes(16).toString('hex')
+}
+
+/**
+ * 根据 yt-dlp proxy 配置创建 axios 可用的 httpAgent / httpsAgent
+ * 同时用于 yt-dlp 取流地址 + 后端代理流媒体请求
+ */
+function createProxyHttpAgent() {
+  const proxyUrl = config.ytDlp?.proxy || ''
+  if (!proxyUrl) return null
+  try {
+    if (proxyUrl.startsWith('socks5://') || proxyUrl.startsWith('socks://')) {
+      return new SocksProxyAgent(proxyUrl)
+    }
+    // HTTP / HTTPS 代理统一使用 HttpsProxyAgent（它同时支持 http 和 https 目标）
+    return new HttpsProxyAgent(proxyUrl)
+  } catch (err) {
+    console.warn('[proxy-agent] 代理配置无效:', proxyUrl, err.message)
+    return null
+  }
+}
+
+// 复用同一个 agent 实例
+const proxyHttpAgent = createProxyHttpAgent()
+if (proxyHttpAgent) {
+  console.log(`[VideoParse] 代理已配置，YouTube 等境外流媒体将走代理`)
+} else {
+  console.log('[VideoParse] 未配置代理（YT_DLP_PROXY），YouTube 等境外流媒体将无法访问')
+}
+
+/**
+ * 判断是否需要走代理（境外平台，CDN 域名被墙）
+ */
+function needsProxyForUrl(url) {
+  return url.includes('youtube.com') || url.includes('youtu.be') ||
+    url.includes('googlevideo.com') || url.includes('ggpht.com')
+}
+
+/**
+ * 返回添加了 proxy agent 的 axios 请求选项（仅当目标域名被墙时）
+ */
+function withOptionalProxy(baseOptions = {}, targetUrl = '') {
+  if (!proxyHttpAgent || !needsProxyForUrl(targetUrl)) {
+    return baseOptions
+  }
+  return {
+    ...baseOptions,
+    httpAgent: proxyHttpAgent,
+    httpsAgent: proxyHttpAgent
+  }
+}
+
+/**
+ * 根据原始视频链接判断需要发送的 Referer
+ */
+function getRefererForUrl(url) {
+  if (url.includes('bilibili.com') || url.includes('b23.tv')) return 'https://www.bilibili.com/'
+  if (url.includes('youtube.com') || url.includes('youtu.be')) return 'https://www.youtube.com/'
+  if (url.includes('qq.com')) return 'https://v.qq.com/'
+  if (url.includes('youku.com')) return 'https://www.youku.com/'
+  if (url.includes('iqiyi.com')) return 'https://www.iqiyi.com/'
+  if (url.includes('mgtv.com')) return 'https://www.mgtv.com/'
+  return ''
+}
 
 // ==================== 解析接口池 ====================
 // 每个接口有 name（名称）、api（接口地址模板，用 {url} 占位）、timeout（超时ms）
@@ -217,6 +325,7 @@ router.get('/auto', async (req, res, next) => {
 // ==================== yt-dlp 集成 ====================
 
 const { binPath, timeout, cookieFile, proxy, verbose } = config.ytDlp || {}
+const searchTimeout = Math.min(timeout || 60000, 30000) // 搜索最多等 30 秒
 
 // 全局状态：yt-dlp 是否可用
 let ytDlpVersion = null
@@ -387,20 +496,23 @@ router.post('/ytdlp/stream-url', async (req, res, next) => {
       })
     }
 
-    const { url: videoUrl, formatId = 'best' } = req.body
+    const { url: videoUrl, formatId } = req.body
     if (!videoUrl) {
       return res.status(400).json({ code: -1, message: '缺少视频链接' })
     }
 
     // -g: 获取直接流地址（不下载）
-    // -f: 指定格式
-    const { stdout } = await runYtDlp([
-      '-f', formatId,
+    // -f: 指定格式（不指定时让 yt-dlp 自动选择，兼容B站等平台）
+    const args = [
       '-g',
       '--no-playlist',
       '--no-check-certificate',
       videoUrl
-    ], timeout)
+    ]
+    if (formatId) {
+      args.unshift('-f', formatId)
+    }
+    const { stdout } = await runYtDlp(args, timeout)
 
     // yt-dlp -g 输出可能是多行（video + audio 分开时），取第一行视频流
     const lines = stdout.split('\n').filter(Boolean)
@@ -416,13 +528,34 @@ router.post('/ytdlp/stream-url', async (req, res, next) => {
       streamType = 'direct'
     }
 
+    // 生成代理 token → 前端通过后端代理访问流媒体，避免 CORS / token 过期
+    const referer = getRefererForUrl(videoUrl)
+    const needProxy = needsProxyForUrl(videoUrl)
+    const token = generateToken()
+    streamCache.set(token, { streamUrl, referer, needProxy, expires: Date.now() + STREAM_TOKEN_TTL })
+
+    // 清理过期条目
+    for (const [key, val] of streamCache) {
+      if (val.expires < Date.now()) streamCache.delete(key)
+    }
+
+    const proxyUrl = `/staticTool/api/video-parse/ytdlp/proxy-stream/${token}`
+
+    // 音频流也生成代理 token
+    let audioProxyUrl = null
+    if (lines[1]) {
+      const audioToken = generateToken()
+      streamCache.set(audioToken, { streamUrl: lines[1], referer, needProxy, expires: Date.now() + STREAM_TOKEN_TTL })
+      audioProxyUrl = `/staticTool/api/video-parse/ytdlp/proxy-stream/${audioToken}`
+    }
+
     res.json({
       code: 0,
       data: {
-        url: streamUrl,
+        url: proxyUrl,
         formatId,
         type: streamType,
-        audioUrl: lines[1] || null  // 单独的音频流（如果有）
+        audioUrl: audioProxyUrl
       }
     })
   } catch (err) {
@@ -442,6 +575,167 @@ router.post('/ytdlp/stream-url', async (req, res, next) => {
       })
     }
     next(err)
+  }
+})
+
+// ==================== 流媒体代理端点 ====================
+
+/**
+ * GET /video-parse/ytdlp/proxy-stream/:token
+ * 代理 HLS/m3u8 流：获取 m3u8 内容，重写分片URL指向本代理
+ * 非 m3u8 的媒体文件（mp4 等）直接代理转发
+ */
+router.get('/ytdlp/proxy-stream/:token', async (req, res) => {
+  try {
+    const { token } = req.params
+    const entry = streamCache.get(token)
+    if (!entry || entry.expires < Date.now()) {
+      streamCache.delete(token)
+      return res.status(404).json({ code: -1, message: '流地址已过期，请重新提取' })
+    }
+
+    const { streamUrl, referer, needProxy } = entry
+    const fetchHeaders = {
+      'Referer': referer || '',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Origin': referer ? new URL(referer).origin : ''
+    }
+
+    // 判断是否为 m3u8
+    const isM3u8 = streamUrl.includes('.m3u8') || streamUrl.includes('/m3u8') ||
+      streamUrl.includes('m3u8')
+
+    // 境外流媒体（YouTube等）需要走代理
+    const axiosOptions = needProxy && proxyHttpAgent
+      ? { httpAgent: proxyHttpAgent, httpsAgent: proxyHttpAgent }
+      : {}
+
+    if (!isM3u8) {
+      // 非 m3u8（mp4 等）：直接代理转发
+      const response = await axios.get(streamUrl, {
+        responseType: 'stream',
+        headers: fetchHeaders,
+        timeout: 300000,
+        ...axiosOptions
+      })
+      const ct = response.headers['content-type'] || 'video/mp4'
+      res.set({
+        'Content-Type': ct,
+        'Access-Control-Allow-Origin': '*',
+        'Accept-Ranges': 'bytes',
+        'Content-Length': response.headers['content-length'] || ''
+      })
+      response.data.pipe(res)
+      return
+    }
+
+    // m3u8：获取内容并重写 URL
+    const response = await axios.get(streamUrl, {
+      responseType: 'text',
+      headers: fetchHeaders,
+      timeout: 15000,
+      ...axiosOptions
+    })
+
+    let m3u8Content = response.data
+    const isMaster = m3u8Content.includes('#EXT-X-STREAM-INF')
+
+    // 辅助：将 URL 编码为代理地址
+    function makeSegmentProxyUrl(originalUrl) {
+      try {
+        const resolved = new URL(originalUrl, streamUrl).href
+        const encoded = Buffer.from(resolved).toString('base64')
+        const encodedRef = Buffer.from(referer || '').toString('base64')
+        return `/staticTool/api/video-parse/ytdlp/proxy-segment?seg=${encodeURIComponent(encoded)}&ref=${encodeURIComponent(encodedRef)}`
+      } catch {
+        return originalUrl
+      }
+    }
+
+    if (isMaster) {
+      // 主播放列表：重写子 m3u8 URL
+      m3u8Content = m3u8Content.split('\n').map(line => {
+        const trimmed = line.trim()
+        if (trimmed && !trimmed.startsWith('#') && (trimmed.endsWith('.m3u8') || trimmed.includes('.m3u8'))) {
+          const resolvedUrl = new URL(trimmed, streamUrl).href
+          const subToken = generateToken()
+          streamCache.set(subToken, { streamUrl: resolvedUrl, referer, needProxy, expires: Date.now() + STREAM_TOKEN_TTL })
+          return `/staticTool/api/video-parse/ytdlp/proxy-stream/${subToken}`
+        }
+        return line
+      }).join('\n')
+    } else {
+      // 媒体播放列表：重写分片和密钥 URL
+      m3u8Content = m3u8Content.split('\n').map(line => {
+        const trimmed = line.trim()
+        // 重写 EXT-X-KEY 中的 URI
+        if (trimmed.startsWith('#EXT-X-KEY') && trimmed.includes('URI=')) {
+          return trimmed.replace(/URI="([^"]+)"/g, (match, uri) => `URI="${makeSegmentProxyUrl(uri)}"`)
+        }
+        // 重写分片文件（.ts, .m4s, .aac 等）
+        if (trimmed && !trimmed.startsWith('#') && !trimmed.endsWith('.m3u8')) {
+          return makeSegmentProxyUrl(trimmed)
+        }
+        return line
+      }).join('\n')
+    }
+
+    res.set({
+      'Content-Type': 'application/vnd.apple.mpegurl',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-cache'
+    })
+    res.send(m3u8Content)
+  } catch (err) {
+    console.error('[proxy-stream error]', err.message)
+    if (!res.headersSent) {
+      res.status(500).json({ code: -1, message: '代理流失败: ' + err.message })
+    }
+  }
+})
+
+/**
+ * GET /video-parse/ytdlp/proxy-segment
+ * 代理 HLS 分片/密钥请求，附加正确的 Referer 和 User-Agent
+ * Query: seg=<base64_encoded_url>&ref=<base64_encoded_referer>
+ */
+router.get('/ytdlp/proxy-segment', async (req, res) => {
+  try {
+    const { seg, ref } = req.query
+    if (!seg) {
+      return res.status(400).json({ code: -1, message: '缺少分片URL' })
+    }
+
+    const segmentUrl = Buffer.from(seg, 'base64').toString('utf-8')
+    const referer = ref ? Buffer.from(ref, 'base64').toString('utf-8') : ''
+
+    if (!segmentUrl.startsWith('http')) {
+      return res.status(400).json({ code: -1, message: '无效的分片URL' })
+    }
+
+    const response = await axios.get(segmentUrl, {
+      responseType: 'stream',
+      headers: {
+        'Referer': referer,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Origin': referer ? new URL(referer).origin : ''
+      },
+      timeout: 30000,
+      ...withOptionalProxy({}, segmentUrl)
+    })
+
+    res.set({
+      'Content-Type': response.headers['content-type'] || 'video/mp2t',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'public, max-age=3600'
+    })
+
+    response.data.pipe(res)
+  } catch (err) {
+    console.error('[proxy-segment error]', err.message)
+    if (!res.headersSent) {
+      res.status(500).json({ code: -1, message: '代理分片失败' })
+    }
   }
 })
 
@@ -760,63 +1054,47 @@ router.post('/ytdlp/search', async (req, res, next) => {
       })
     }
 
-    const { query, platform = 'auto', limit = 10 } = req.body
+    const { query, platform = 'bilibili', limit = 10 } = req.body
     if (!query || !query.trim()) {
       return res.status(400).json({ code: -1, message: '缺少搜索关键词' })
     }
 
     const trimmedQuery = query.trim()
-    const maxLimit = Math.min(Math.max(1, parseInt(limit, 10) || 10), 30)
+    const maxLimit = Math.min(Math.max(1, parseInt(limit, 10) || 10), 20)
+    const searchPlatform = String(platform || 'bilibili')
 
-    console.log(`[yt-dlp search] query="${trimmedQuery}" platform="${platform}" limit=${limit} maxLimit=${maxLimit}`)
-
-    // 构建搜索任务列表
-    const searchTasks = []
-
-    if (platform === 'youtube') {
-      // 仅 YouTube
-      searchTasks.push({
-        label: 'YouTube',
-        searchQuery: `ytsearch${maxLimit}:${trimmedQuery}`
-      })
-    } else if (platform === 'bilibili') {
-      // 仅 Bilibili
-      searchTasks.push({
-        label: 'Bilibili',
-        searchQuery: `bilisearch${maxLimit}:${trimmedQuery}`
-      })
-    } else {
-      // auto / 其他平台：多平台并行搜索
-      searchTasks.push({
-        label: 'Bilibili',
-        searchQuery: `bilisearch${maxLimit}:${trimmedQuery}`
-      })
-      searchTasks.push({
-        label: 'YouTube',
-        searchQuery: `ytsearch${maxLimit}:${trimmedQuery}`
-      })
-      // 如果是中文影视查询，追加"电视剧 全集"搜索
-      if (isMediaQuery(trimmedQuery)) {
-        const enhancedQuery = `${trimmedQuery} 电视剧 全集`
-        searchTasks.push({
-          label: 'Bilibili+',
-          searchQuery: `bilisearch${maxLimit}:${enhancedQuery}`
-        })
-        searchTasks.push({
-          label: 'YouTube+',
-          searchQuery: `ytsearch${maxLimit}:${enhancedQuery}`
-        })
-      }
+    // ========== 缓存检查 ==========
+    const cached = getCachedSearch(searchPlatform, trimmedQuery)
+    if (cached) {
+      return res.json({ code: 0, data: cached.data, cached: true })
     }
 
-    console.log(`[yt-dlp search] 共 ${searchTasks.length} 个搜索任务: ${searchTasks.map(t => t.label).join(', ')}`)
+    console.log(`[yt-dlp search] query="${trimmedQuery}" platform="${searchPlatform}" limit=${maxLimit}`)
 
-    // 并行执行所有搜索
+    // ========== 构建搜索任务 ==========
+    const searchTasks = []
+
+    switch (searchPlatform) {
+      case 'youtube':
+        searchTasks.push({ label: 'YouTube', searchQuery: `ytsearch${maxLimit}:${trimmedQuery}` })
+        break
+      case 'bilibili_youtube':
+        // 用户明确要求双搜
+        searchTasks.push({ label: 'Bilibili', searchQuery: `bilisearch${maxLimit}:${trimmedQuery}` })
+        searchTasks.push({ label: 'YouTube', searchQuery: `ytsearch${maxLimit}:${trimmedQuery}` })
+        break
+      case 'bilibili':
+      default:
+        searchTasks.push({ label: 'Bilibili', searchQuery: `bilisearch${maxLimit}:${trimmedQuery}` })
+        break
+    }
+
+    // ========== 并行执行搜索 ==========
     const settled = await Promise.allSettled(
-      searchTasks.map(t => doSearch(t.searchQuery, timeout))
+      searchTasks.map(t => doSearch(t.searchQuery, searchTimeout))
     )
 
-    // 合并结果并去重（按 video id）
+    // 合并去重
     const seenIds = new Set()
     const allResults = []
     for (let i = 0; i < settled.length; i++) {
@@ -842,59 +1120,28 @@ router.post('/ytdlp/search', async (req, res, next) => {
     // 智能过滤和分组
     const { groups, ungrouped } = filterAndGroupResults(allResults)
 
-    // 如果过滤后有效内容太少（<3条），尝试用增强关键词再搜
-    const totalValid = groups.reduce((sum, g) => sum + g.episodes.length, 0) + ungrouped.length
-    if (totalValid < 3 && isMediaQuery(trimmedQuery) && platform !== 'bilibili' && platform !== 'youtube') {
-      console.log(`[yt-dlp search] 有效内容太少(${totalValid}条)，使用增强关键词重试`)
-
-      const retryQuery = `${trimmedQuery} 电视剧`
-      const retryTasks = [
-        { label: 'Retry-Bilibili', searchQuery: `bilisearch${maxLimit}:${retryQuery}` },
-        { label: 'Retry-YouTube', searchQuery: `ytsearch${maxLimit}:${retryQuery}` }
-      ]
-
-      const retrySettled = await Promise.allSettled(
-        retryTasks.map(t => doSearch(t.searchQuery, timeout))
-      )
-
-      for (let i = 0; i < retrySettled.length; i++) {
-        const s = retrySettled[i]
-        const label = retryTasks[i].label
-        if (s.status === 'fulfilled' && s.value.length > 0) {
-          const newOnes = []
-          for (const r of s.value) {
-            if (!seenIds.has(r.id)) {
-              seenIds.add(r.id)
-              newOnes.push(r)
-            }
-          }
-          allResults.push(...newOnes)
-          console.log(`[yt-dlp search] ${label}: ${s.value.length} 条, 去重后新增 ${newOnes.length} 条`)
-        }
-      }
+    const responseData = {
+      query: trimmedQuery,
+      platform: searchPlatform,
+      total: allResults.length,
+      groupCount: groups.length,
+      results: allResults,
+      groups: groups.map(g => ({
+        showName: g.showName,
+        uploader: g.uploader,
+        thumbnail: g.thumbnail,
+        episodeCount: g.episodes.length,
+        episodes: g.episodes
+      })),
+      ungrouped
     }
 
-    // 最终过滤分组
-    const finalResult = filterAndGroupResults(allResults)
+    // 缓存结果
+    setCachedSearch(searchPlatform, trimmedQuery, { results: allResults, data: responseData })
 
     res.json({
       code: 0,
-      data: {
-        query: trimmedQuery,
-        platform,
-        total: allResults.length,
-        filteredCount: allResults.length,
-        groupCount: finalResult.groups.length,
-        results: allResults,
-        groups: finalResult.groups.map(g => ({
-          showName: g.showName,
-          uploader: g.uploader,
-          thumbnail: g.thumbnail,
-          episodeCount: g.episodes.length,
-          episodes: g.episodes
-        })),
-        ungrouped: finalResult.ungrouped
-      }
+      data: responseData
     })
   } catch (err) {
     if (err.stderr) {
