@@ -771,7 +771,7 @@ router.get('/tts-voices', (req, res) => {
       ttsAvailable: edgeAvailable,          // Edge TTS 始终可用
       cloneAvailable,                        // 语音克隆是否配置
       cloneNeedPassword,                     // 语音克隆是否需要密码
-      defaultVoice: 'zh-CN-XiaoxiaoNeural',  // Edge TTS 默认音色
+      defaultVoice: 'zh-CN-YunjianNeural',  // Edge TTS 默认音色：云健
       presetVoices: EDGE_VOICES,             // Edge TTS 免费音色列表
       customVoices: customVoiceList,         // 用户自定义音色
       allVoices: [
