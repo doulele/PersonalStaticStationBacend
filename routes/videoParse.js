@@ -578,6 +578,167 @@ router.post('/ytdlp/stream-url', async (req, res, next) => {
   }
 })
 
+// ==================== 音频流缓存 ====================
+// key: 视频URL → { proxyUrl, expires, title }
+const audioStreamCache = new Map()
+const AUDIO_STREAM_CACHE_TTL = 30 * 60 * 1000 // 30 分钟
+const AUDIO_CACHE_MAX = 100
+
+function getCachedAudioStream(videoUrl) {
+  const entry = audioStreamCache.get(videoUrl)
+  if (entry && Date.now() - entry.timestamp < AUDIO_STREAM_CACHE_TTL) {
+    console.log(`[audio cache] HIT "${videoUrl.substring(0, 50)}..."`)
+    return entry
+  }
+  return null
+}
+
+function setCachedAudioStream(videoUrl, data) {
+  if (audioStreamCache.size >= AUDIO_CACHE_MAX) {
+    const entries = [...audioStreamCache.entries()]
+      .sort((a, b) => a[1].timestamp - b[1].timestamp)
+    const toDelete = entries.slice(0, Math.floor(AUDIO_CACHE_MAX / 2))
+    for (const [k] of toDelete) audioStreamCache.delete(k)
+    console.log(`[audio cache] 清理 ${toDelete.length} 条过期音频缓存`)
+  }
+  audioStreamCache.set(videoUrl, { ...data, timestamp: Date.now() })
+  console.log(`[audio cache] SET "${videoUrl.substring(0, 50)}..."`)
+}
+
+// ==================== 音频流提取端点 ====================
+
+/**
+ * POST /video-parse/ytdlp/audio-stream
+ * 专门提取纯音频流地址（-f bestaudio），用于音乐播放场景
+ * Body: { url: "视频链接" }
+ * 返回: { code, data: { url: "代理后的音频流URL", title, duration, thumbnail } }
+ *
+ * 缓存策略：
+ * - 同一视频URL的音频流地址缓存 30 分钟
+ * - 前端拿到代理URL后可继续在客户端缓存
+ */
+router.post('/ytdlp/audio-stream', async (req, res, next) => {
+  try {
+    if (!ytDlpAvailable) {
+      return res.status(503).json({
+        code: -1,
+        message: 'yt-dlp 未安装或不可用'
+      })
+    }
+
+    const { url: videoUrl } = req.body
+    if (!videoUrl) {
+      return res.status(400).json({ code: -1, message: '缺少视频链接' })
+    }
+
+    // ========== 缓存检查 ==========
+    const cached = getCachedAudioStream(videoUrl)
+    if (cached) {
+      return res.json({
+        code: 0,
+        data: {
+          url: cached.proxyUrl,
+          title: cached.title || '',
+          duration: cached.duration || 0,
+          thumbnail: cached.thumbnail || '',
+          cached: true
+        }
+      })
+    }
+
+    console.log(`[yt-dlp audio] 提取音频流: "${videoUrl.substring(0, 60)}..."`)
+
+    // 阶段1: 获取视频元信息
+    let title = ''
+    let duration = 0
+    let thumbnail = ''
+    try {
+      const { stdout } = await runYtDlp([
+        '-j', '--no-playlist', '--no-check-certificate', videoUrl
+      ], timeout)
+      const info = JSON.parse(stdout)
+      title = info.title || ''
+      duration = info.duration || 0
+      thumbnail = info.thumbnail || ''
+    } catch (err) {
+      // 元信息获取失败不阻塞，继续获取音频流
+      console.warn('[yt-dlp audio] 获取元信息失败:', (err.stderr || err.message || '').substring(0, 200))
+    }
+
+    // 阶段2: 获取纯音频流地址
+    // -f bestaudio: 只选最佳音频格式
+    // -g: 输出直接流地址
+    const { stdout } = await runYtDlp([
+      '-f', 'bestaudio',
+      '-g',
+      '--no-playlist',
+      '--no-check-certificate',
+      videoUrl
+    ], timeout)
+
+    const audioStreamUrl = stdout.split('\n').filter(Boolean)[0]
+    if (!audioStreamUrl || !audioStreamUrl.startsWith('http')) {
+      return res.status(400).json({
+        code: -1,
+        message: '未能提取到音频流地址，该平台可能不支持纯音频提取'
+      })
+    }
+
+    // 生成代理 token
+    const referer = getRefererForUrl(videoUrl)
+    const needProxy = needsProxyForUrl(videoUrl)
+    const token = generateToken()
+    streamCache.set(token, {
+      streamUrl: audioStreamUrl,
+      referer,
+      needProxy,
+      expires: Date.now() + STREAM_TOKEN_TTL
+    })
+
+    // 清理过期 streamCache
+    for (const [key, val] of streamCache) {
+      if (val.expires < Date.now()) streamCache.delete(key)
+    }
+
+    const proxyUrl = `/staticTool/api/video-parse/ytdlp/proxy-stream/${token}`
+
+    // 缓存结果
+    setCachedAudioStream(videoUrl, {
+      proxyUrl,
+      title,
+      duration,
+      thumbnail
+    })
+
+    res.json({
+      code: 0,
+      data: {
+        url: proxyUrl,
+        title,
+        duration,
+        thumbnail,
+        cached: false
+      }
+    })
+  } catch (err) {
+    if (err.stderr) {
+      console.error('[yt-dlp audio error]', err.stderr.substring(0, 500))
+      return res.status(400).json({
+        code: -1,
+        message: '提取音频流失败，可能是链接无效或平台不支持',
+        detail: err.stderr.substring(0, 300)
+      })
+    }
+    if (err.killed || err.code === 'ETIMEDOUT') {
+      return res.status(504).json({
+        code: -1,
+        message: '提取超时，yt-dlp 执行时间过长，请重试'
+      })
+    }
+    next(err)
+  }
+})
+
 // ==================== 流媒体代理端点 ====================
 
 /**
@@ -1239,6 +1400,91 @@ router.post('/ytdlp/playlist', async (req, res, next) => {
       return res.status(504).json({ code: -1, message: '提取超时，请稍后重试' })
     }
     next(err)
+  }
+})
+
+/**
+ * GET /video-parse/ytdlp/image-proxy
+ * 代理B站图片，解决403防盗链问题
+ * Query: ?url=encodeURIComponent(原图URL)
+ */
+router.get('/ytdlp/image-proxy', async (req, res) => {
+  try {
+    const { url } = req.query
+    if (!url) return res.status(400).json({ code: -1, message: '缺少 url 参数' })
+
+    const proxyUrl = decodeURIComponent(url)
+    // 安全校验：只允许 http/https 协议
+    if (!/^https?:\/\//i.test(proxyUrl)) {
+      return res.status(400).json({ code: -1, message: '不支持的 URL 协议' })
+    }
+
+    const response = await axios.get(proxyUrl, {
+      responseType: 'arraybuffer',
+      headers: {
+        'Referer': 'https://www.bilibili.com/',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+      },
+      timeout: 10000
+    })
+
+    const contentType = response.headers['content-type'] || 'image/jpeg'
+    res.setHeader('Content-Type', contentType)
+    res.setHeader('Cache-Control', 'public, max-age=86400')
+    res.send(Buffer.from(response.data))
+  } catch (e) {
+    console.error('[image-proxy] 代理失败:', e.message)
+    res.status(502).json({ code: -1, message: '图片加载失败' })
+  }
+})
+
+/**
+ * GET /video-parse/ytdlp/lyrics
+ * 搜索歌词（LRC格式），支持按歌名+歌手查找
+ * Query: ?title=歌名&artist=歌手（artist可选）
+ * 返回：{ code:0, data:{ syncedLyrics:"[00:01.00]歌词行\n...", plainLyrics:"纯文本歌词" } }
+ */
+router.get('/ytdlp/lyrics', async (req, res) => {
+  try {
+    const { title, artist } = req.query
+    if (!title) return res.status(400).json({ code: -1, message: '缺少 title 参数' })
+
+    const query = artist ? `${title} ${artist}` : title
+    let lyricsUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`
+
+    const searchRes = await axios.get(lyricsUrl, {
+      headers: { 'User-Agent': 'PersonalStaticStation/1.0' },
+      timeout: 8000
+    })
+
+    const results = searchRes.data || []
+    if (!results.length) {
+      return res.json({ code: 0, data: { syncedLyrics: '', plainLyrics: '', message: '未找到歌词' } })
+    }
+
+    // 取最匹配的结果，尝试获取完整LRC
+    const best = results[0]
+    let syncedLyrics = best.syncedLyrics || ''
+    let plainLyrics = best.plainLyrics || ''
+
+    // 如果没有同步歌词，尝试用id获取完整信息
+    if (!syncedLyrics && best.id) {
+      try {
+        const detailRes = await axios.get(`https://lrclib.net/api/get/${best.id}`, {
+          headers: { 'User-Agent': 'PersonalStaticStation/1.0' },
+          timeout: 5000
+        })
+        syncedLyrics = detailRes.data?.syncedLyrics || ''
+        plainLyrics = detailRes.data?.plainLyrics || plainLyrics
+      } catch (e) { /* 忽略 */ }
+    }
+
+    res.setHeader('Cache-Control', 'public, max-age=86400')
+    res.json({ code: 0, data: { syncedLyrics, plainLyrics, title: best.trackName, artist: best.artistName } })
+  } catch (e) {
+    console.error('[lyrics] 搜索失败:', e.message)
+    // 降级：返回空结果而不是报错
+    res.json({ code: 0, data: { syncedLyrics: '', plainLyrics: '', message: '歌词服务暂不可用' } })
   }
 })
 
