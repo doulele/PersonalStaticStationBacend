@@ -1,77 +1,25 @@
 {
   "whitenoise": [
-    {
-      "id": "white",
-      "label": "白噪音",
-      "color": "default",
-      "type": "white"
-    },
-    {
-      "id": "pink",
-      "label": "粉红噪音",
-      "color": "pink",
-      "type": "pink"
-    },
-    {
-      "id": "brown",
-      "label": "棕色噪音",
-      "color": "brown",
-      "type": "brown"
-    },
-    {
-      "id": "rain",
-      "label": "雨声",
-      "color": "blue",
-      "type": "rain"
-    },
-    {
-      "id": "thunder",
-      "label": "雷雨声",
-      "color": "indigo",
-      "type": "thunder"
-    },
-    {
-      "id": "ocean",
-      "label": "海浪声",
-      "color": "teal",
-      "type": "ocean"
-    },
-    {
-      "id": "stream",
-      "label": "溪流声",
-      "color": "cyan",
-      "type": "stream"
-    },
-    {
-      "id": "fan",
-      "label": "风扇声",
-      "color": "green",
-      "type": "fan"
-    },
-    {
-      "id": "campfire",
-      "label": "篝火声",
-      "color": "orange",
-      "type": "campfire"
-    },
-    {
-      "id": "heartbeat",
-      "label": "心跳声",
-      "color": "red",
-      "type": "heartbeat"
-    },
-    {
-      "id": "windchime",
-      "label": "风铃声",
-      "color": "purple",
-      "type": "windchime"
-    },
-    {
-      "id": "tvstatic",
-      "label": "电视雪花",
-      "color": "gray",
-      "type": "tvstatic"
-    }
+    { "id": "white", "label": "白噪音", "color": "default", "type": "white" },
+    { "id": "pink", "label": "粉红噪音", "color": "pink", "type": "pink" },
+    { "id": "brown", "label": "棕色噪音", "color": "brown", "type": "brown" },
+    { "id": "rain", "label": "细雨声", "color": "sky", "type": "rain" },
+    { "id": "rain_heavy", "label": "大雨声", "color": "blue", "type": "rain_heavy" },
+    { "id": "thunder", "label": "雷雨声", "color": "indigo", "type": "thunder" },
+    { "id": "ocean", "label": "海浪声", "color": "teal", "type": "ocean" },
+    { "id": "stream", "label": "溪流声", "color": "cyan", "type": "stream" },
+    { "id": "waterfall", "label": "瀑布声", "color": "emerald", "type": "waterfall" },
+    { "id": "fan", "label": "风扇声", "color": "green", "type": "fan" },
+    { "id": "vacuum", "label": "吸尘器", "color": "lime", "type": "vacuum" },
+    { "id": "washing", "label": "洗衣机", "color": "slate", "type": "washing" },
+    { "id": "campfire", "label": "篝火声", "color": "orange", "type": "campfire" },
+    { "id": "heartbeat", "label": "心跳声", "color": "red", "type": "heartbeat" },
+    { "id": "windchime", "label": "风铃声", "color": "purple", "type": "windchime" },
+    { "id": "musicbox", "label": "八音盒", "color": "violet", "type": "musicbox" },
+    { "id": "crickets", "label": "蟋蟀声", "color": "amber", "type": "crickets" },
+    { "id": "cat_purr", "label": "猫咪呼噜", "color": "rose", "type": "cat_purr" },
+    { "id": "train", "label": "火车声", "color": "stone", "type": "train" },
+    { "id": "tvstatic", "label": "电视雪花", "color": "gray", "type": "tvstatic" }
   ],
   "classics": [
     {

@@ -1443,34 +1443,50 @@ router.get('/ytdlp/image-proxy', async (req, res) => {
  * 搜索歌词（LRC格式），支持按歌名+歌手查找
  * Query: ?title=歌名&artist=歌手（artist可选）
  * 返回：{ code:0, data:{ syncedLyrics:"[00:01.00]歌词行\n...", plainLyrics:"纯文本歌词" } }
+ *
+ * 增强：多轮尝试不同搜索词，提高儿童/哄睡歌曲命中率
  */
 router.get('/ytdlp/lyrics', async (req, res) => {
   try {
     const { title, artist } = req.query
     if (!title) return res.status(400).json({ code: -1, message: '缺少 title 参数' })
 
-    const query = artist ? `${title} ${artist}` : title
-    let lyricsUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(query)}`
+    // 构建多轮搜索词（从精确→宽泛），前一轮无结果则尝试下一轮
+    const searchQueries = [title]
+    if (artist) searchQueries.push(`${title} ${artist}`)
+    // 清洗常见视频标题标签（如 "【儿歌】"、"（完整版）" 等），提高匹配率
+    const cleanedTitle = title.replace(/【[^】]*】|（[^）]*）|\([^)]*\)|\[[^\]]*\]|\s*-\s*(完整|高清|MV|官方).*/g, '').trim()
+    if (cleanedTitle && cleanedTitle !== title) searchQueries.push(cleanedTitle)
+    if (artist && cleanedTitle) searchQueries.push(`${cleanedTitle} ${artist}`)
 
-    const searchRes = await axios.get(lyricsUrl, {
-      headers: { 'User-Agent': 'PersonalStaticStation/1.0' },
-      timeout: 8000
-    })
+    let bestResult = null
+    for (const q of searchQueries) {
+      try {
+        const lyricsUrl = `https://lrclib.net/api/search?q=${encodeURIComponent(q)}`
+        const searchRes = await axios.get(lyricsUrl, {
+          headers: { 'User-Agent': 'PersonalStaticStation/1.0' },
+          timeout: 6000
+        })
+        const results = searchRes.data || []
+        if (results.length > 0) {
+          // 优先选有 syncedLyrics 的
+          bestResult = results.find(r => r.syncedLyrics) || results[0]
+          break
+        }
+      } catch (e) { /* 该轮搜索失败，继续下一轮 */ }
+    }
 
-    const results = searchRes.data || []
-    if (!results.length) {
+    if (!bestResult) {
       return res.json({ code: 0, data: { syncedLyrics: '', plainLyrics: '', message: '未找到歌词' } })
     }
 
-    // 取最匹配的结果，尝试获取完整LRC
-    const best = results[0]
-    let syncedLyrics = best.syncedLyrics || ''
-    let plainLyrics = best.plainLyrics || ''
+    let syncedLyrics = bestResult.syncedLyrics || ''
+    let plainLyrics = bestResult.plainLyrics || ''
 
     // 如果没有同步歌词，尝试用id获取完整信息
-    if (!syncedLyrics && best.id) {
+    if (!syncedLyrics && bestResult.id) {
       try {
-        const detailRes = await axios.get(`https://lrclib.net/api/get/${best.id}`, {
+        const detailRes = await axios.get(`https://lrclib.net/api/get/${bestResult.id}`, {
           headers: { 'User-Agent': 'PersonalStaticStation/1.0' },
           timeout: 5000
         })
@@ -1479,8 +1495,24 @@ router.get('/ytdlp/lyrics', async (req, res) => {
       } catch (e) { /* 忽略 */ }
     }
 
+    // 仍无同步歌词但有纯文本 → 按行拆分并均匀分配时间轴，实现基础滚动
+    if (!syncedLyrics && plainLyrics) {
+      const plainLines = plainLyrics.split('\n').filter(l => l.trim())
+      if (plainLines.length > 0) {
+        // 假设总时长 180 秒（3分钟），均匀分配时间戳
+        const DURATION = 180
+        const interval = DURATION / plainLines.length
+        syncedLyrics = plainLines.map((line, i) => {
+          const t = i * interval
+          const m = String(Math.floor(t / 60)).padStart(2, '0')
+          const s = String(Math.floor(t % 60)).padStart(2, '0')
+          return `[${m}:${s}.00]${line.trim()}`
+        }).join('\n')
+      }
+    }
+
     res.setHeader('Cache-Control', 'public, max-age=86400')
-    res.json({ code: 0, data: { syncedLyrics, plainLyrics, title: best.trackName, artist: best.artistName } })
+    res.json({ code: 0, data: { syncedLyrics, plainLyrics, title: bestResult.trackName, artist: bestResult.artistName } })
   } catch (e) {
     console.error('[lyrics] 搜索失败:', e.message)
     // 降级：返回空结果而不是报错
