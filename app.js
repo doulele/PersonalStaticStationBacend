@@ -15,9 +15,9 @@ app.use(cors({
   credentials: true
 }))
 
-// 解析请求体（增大限制以支持 base64 图片上传，腾讯云 OCR 上限 7MB）
-app.use(express.json({ limit: '10mb' }))
-app.use(express.urlencoded({ extended: true, limit: '10mb' }))
+// 解析请求体（增大限制以支持 base64 图片/音频上传）
+app.use(express.json({ limit: '25mb' }))
+app.use(express.urlencoded({ extended: true, limit: '25mb' }))
 
 // 请求日志
 app.use((req, res, next) => {

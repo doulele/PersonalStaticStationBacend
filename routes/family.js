@@ -1,31 +1,16 @@
 import { Router } from 'express'
-import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'fs'
+import { readFileSync, existsSync, writeFileSync, mkdirSync, unlinkSync, createReadStream, statSync } from 'fs'
 import { fileURLToPath } from 'url'
-import { dirname, join } from 'path'
+import { dirname, join, extname } from 'path'
 import crypto from 'crypto'
-import http from 'http'
-import https from 'https'
 import WebSocket from 'ws'
-import config from '../config/index.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
 
 const DATA_PATH = join(__dirname, '..', 'data', 'sleep-content.json')
-const VOICES_STORE_PATH = join(__dirname, '..', 'data', 'custom-voices.json')
 
 // ==================== 音色配置 ====================
-
-// Qwen3-TTS 预置音色（仅用于语音克隆合成）
-const QWEN3_VOICES = [
-  { id: 'cherry', label: '御姐 Cherry', gender: 'female', desc: '成熟温暖', type: 'preset' },
-  { id: 'stella', label: '知性 Stella', gender: 'female', desc: '温柔知性', type: 'preset' },
-  { id: 'bella', label: '甜美 Bella', gender: 'female', desc: '甜美活泼', type: 'preset' },
-  { id: 'luna', label: '少女 Luna', gender: 'female', desc: '清纯少女', type: 'preset' },
-  { id: 'peter', label: '少年 Peter', gender: 'male', desc: '阳光少年', type: 'preset' },
-  { id: 'eric', label: '温柔 Eric', gender: 'male', desc: '温柔男声', type: 'preset' },
-  { id: 'brian', label: '沉稳 Brian', gender: 'male', desc: '低沉磁性', type: 'preset' }
-]
 
 // Edge TTS 免费微软音色（日常朗读使用，来自微软官方在线列表）
 const EDGE_VOICES = [
@@ -45,88 +30,7 @@ const EDGE_VOICES = [
   { id: 'zh-TW-YunJheNeural', label: '雲哲', gender: 'male', desc: '台湾国语', type: 'preset' }
 ]
 
-// 前端旧 ID → Edge TTS 音色映射（兼容过渡）
-const VOICE_ID_TO_EDGE = {
-  cherry: 'zh-CN-XiaoxiaoNeural',
-  stella: 'zh-CN-XiaoruiNeural',
-  bella: 'zh-CN-XiaoyiNeural',
-  luna: 'zh-CN-XiaoshuangNeural',
-  peter: 'zh-CN-YunxiNeural',
-  eric: 'zh-CN-YunyangNeural',
-  brian: 'zh-CN-YunjianNeural'
-}
-
-// 用户自定义音色存储
-function loadCustomVoices() {
-  try {
-    if (existsSync(VOICES_STORE_PATH)) {
-      return JSON.parse(readFileSync(VOICES_STORE_PATH, 'utf-8'))
-    }
-  } catch (e) { console.error('[family] 读取自定义音色失败:', e) }
-  return []
-}
-
-function saveCustomVoices(voices) {
-  try {
-    mkdirSync(dirname(VOICES_STORE_PATH), { recursive: true })
-    writeFileSync(VOICES_STORE_PATH, JSON.stringify(voices, null, 2), 'utf-8')
-  } catch (e) { console.error('[family] 保存自定义音色失败:', e) }
-}
-
 // ==================== 工具函数 ====================
-
-// 发送 HTTPS POST 请求到 DashScope
-function dashscopePost(hostname, path, body, apiKey) {
-  return new Promise((resolve, reject) => {
-    const postData = JSON.stringify(body)
-    const options = {
-      hostname,
-      port: 443,
-      path,
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(postData)
-      }
-    }
-    const req = https.request(options, (resp) => {
-      let data = ''
-      resp.on('data', chunk => { data += chunk })
-      resp.on('end', () => {
-        try {
-          resolve({ status: resp.statusCode, body: JSON.parse(data) })
-        } catch (e) {
-          resolve({ status: resp.statusCode, body: data, parseError: true })
-        }
-      })
-    })
-    req.on('error', (e) => reject(e))
-    req.write(postData)
-    req.end()
-  })
-}
-
-// 从 URL 下载音频并转为 base64（支持 http 和 https）
-function downloadAudioAsBase64(url) {
-  return new Promise((resolve, reject) => {
-    const isHttps = url.startsWith('https://')
-    const client = isHttps ? https : http
-    client.get(url, (resp) => {
-      // 处理重定向
-      if (resp.statusCode >= 300 && resp.statusCode < 400 && resp.headers.location) {
-        return downloadAudioAsBase64(resp.headers.location).then(resolve).catch(reject)
-      }
-      const chunks = []
-      resp.on('data', chunk => chunks.push(chunk))
-      resp.on('end', () => {
-        const buffer = Buffer.concat(chunks)
-        resolve(buffer.toString('base64'))
-      })
-      resp.on('error', reject)
-    }).on('error', reject)
-  })
-}
 
 // ==================== Edge TTS 免费语音合成 ====================
 
@@ -524,288 +428,202 @@ router.post('/tts/edge', async (req, res) => {
 })
 
 /**
- * Qwen3-TTS 语音合成（仅用于语音克隆自定义音色，需密码）
- * POST /family/tts
- * Body: { text, customVoiceId, speed?, clonePassword }
- */
-router.post('/tts', async (req, res) => {
-  try {
-    const { text, customVoiceId, speed = 1.0, clonePassword } = req.body
-
-    // 语音克隆需要密码验证
-    if (config.voiceClonePassword && clonePassword !== config.voiceClonePassword) {
-      return res.status(403).json({
-        success: false,
-        error: '语音克隆需要授权密码',
-        needPassword: true
-      })
-    }
-
-    if (!customVoiceId) {
-      return res.status(400).json({
-        success: false,
-        error: '请使用语音克隆音色或使用 /tts/edge 免费接口',
-        fallback: true
-      })
-    }
-
-    if (!config.dashscopeApiKey || !config.dashscopeWorkspaceId) {
-      return res.status(503).json({
-        success: false,
-        error: '语音克隆需要配置 DASHSCOPE_API_KEY 和 DASHSCOPE_WORKSPACE_ID',
-        fallback: true
-      })
-    }
-
-    if (!text || typeof text !== 'string' || text.trim().length === 0) {
-      return res.status(400).json({ success: false, error: 'text 参数不能为空' })
-    }
-
-    const trimmedText = text.trim().slice(0, 1000)
-    const validSpeed = Math.max(0.5, Math.min(2.0, Number(speed) || 1.0))
-
-    const result = await dashscopePost(
-      `${config.dashscopeWorkspaceId}.cn-beijing.maas.aliyuncs.com`,
-      '/api/v1/services/aigc/multimodal-generation/generation',
-      {
-        model: 'qwen3-tts-vc-2026-01-22',
-        input: { text: trimmedText, voice: customVoiceId },
-        parameters: { speech_rate: validSpeed, format: 'mp3' }
-      },
-      config.dashscopeApiKey
-    )
-
-    if (result.status !== 200 || result.body.code) {
-      console.error('[family/tts/clone] 错误:', result.status, JSON.stringify(result.body).slice(0, 300))
-      return res.status(502).json({
-        success: false,
-        error: `声音复刻合成失败: ${result.body.message || result.status}`,
-        fallback: true
-      })
-    }
-
-    const audioResult = result.body.output?.audio
-    if (!audioResult) {
-      return res.status(502).json({ success: false, error: 'TTS 响应缺少音频数据', fallback: true })
-    }
-
-    let audioBase64
-    if (typeof audioResult === 'string') {
-      audioBase64 = audioResult
-    } else if (audioResult.url) {
-      try {
-        audioBase64 = await downloadAudioAsBase64(audioResult.url)
-      } catch (downloadErr) {
-        console.error('[family/tts] 下载音频失败:', downloadErr.message)
-        return res.status(502).json({ success: false, error: '下载 TTS 音频失败', fallback: true })
-      }
-    } else {
-      return res.status(502).json({ success: false, error: 'TTS 音频格式异常', fallback: true })
-    }
-
-    return res.json({
-      success: true,
-      data: {
-        audio: audioBase64,
-        format: 'mp3',
-        voice: customVoiceId,
-        speed: validSpeed,
-        isCloned: true,
-        usage: result.body.usage || null
-      }
-    })
-  } catch (err) {
-    console.error('[family/tts] 异常:', err)
-    return res.status(500).json({ success: false, error: 'TTS 服务异常', fallback: true })
-  }
-})
-
-// ==================== 语音克隆（声音复刻）API ====================
-
-/**
- * 注册自定义音色（声音复刻）
- * POST /family/tts/enroll
- * Body: { audioBase64, audioUrl?, name }
- * - audioBase64: 参考音频的 base64（不含 data URI 前缀）
- * - audioUrl: 参考音频的公网 URL（二选一，优先使用 URL）
- * - name: 音色名称
- *
- * 要求：音频 10~20 秒，清晰朗读，无背景音，WAV/MP3/M4A
- */
-router.post('/tts/enroll', async (req, res) => {
-  try {
-    // 语音克隆需要密码验证
-    if (config.voiceClonePassword && req.body.clonePassword !== config.voiceClonePassword) {
-      return res.status(403).json({
-        success: false,
-        error: '语音克隆需要授权密码',
-        needPassword: true
-      })
-    }
-
-    if (!config.dashscopeApiKey || !config.dashscopeWorkspaceId) {
-      return res.status(503).json({
-        success: false,
-        error: '语音克隆需要配置 DASHSCOPE_API_KEY 和 DASHSCOPE_WORKSPACE_ID'
-      })
-    }
-
-    const { audioBase64, audioUrl, name } = req.body
-
-    if (!name || typeof name !== 'string' || name.trim().length === 0) {
-      return res.status(400).json({ success: false, error: '请提供音色名称' })
-    }
-
-    // 构建音频数据
-    let audioData
-    if (audioUrl && audioUrl.startsWith('https://')) {
-      audioData = audioUrl
-    } else if (audioBase64) {
-      // 构造 data URI
-      const mimeType = audioBase64.startsWith('/9j/') ? 'image/jpeg' :
-                       audioBase64.startsWith('UklGR') ? 'audio/wav' : 'audio/mpeg'
-      audioData = `data:${mimeType};base64,${audioBase64}`
-    } else {
-      return res.status(400).json({ success: false, error: '请提供参考音频（audioBase64 或 audioUrl）' })
-    }
-
-    const preferredName = name.trim().slice(0, 20)
-
-    console.log(`[family/tts/enroll] 创建音色: ${preferredName}`)
-
-    const result = await dashscopePost(
-      `${config.dashscopeWorkspaceId}.cn-beijing.maas.aliyuncs.com`,
-      '/api/v1/services/audio/tts/customization',
-      {
-        model: 'qwen-voice-enrollment',
-        input: {
-          action: 'create',
-          target_model: 'qwen3-tts-vc-2026-01-22',
-          preferred_name: preferredName,
-          audio: { data: audioData }
-        }
-      },
-      config.dashscopeApiKey
-    )
-
-    if (result.status !== 200) {
-      console.error('[family/tts/enroll] 注册失败:', result.status, JSON.stringify(result.body).slice(0, 300))
-      return res.status(502).json({
-        success: false,
-        error: `音色注册失败: ${result.body.message || result.body.code || result.status}`
-      })
-    }
-
-    if (result.body.code) {
-      console.error('[family/tts/enroll] DashScope 错误:', result.body)
-      return res.status(502).json({
-        success: false,
-        error: result.body.message || '音色注册失败'
-      })
-    }
-
-    const voiceId = result.body.output?.voice
-    if (!voiceId) {
-      console.error('[family/tts/enroll] 未返回 voice_id')
-      return res.status(502).json({
-        success: false,
-        error: '音色注册失败：未返回音色 ID'
-      })
-    }
-
-    // 保存到本地存储
-    const customVoices = loadCustomVoices()
-    const newVoice = {
-      id: voiceId,
-      name: preferredName,
-      createdAt: new Date().toISOString(),
-      model: 'qwen3-tts-vc-2026-01-22'
-    }
-    customVoices.push(newVoice)
-    saveCustomVoices(customVoices)
-
-    console.log(`[family/tts/enroll] 音色注册成功: ${preferredName} → ${voiceId}`)
-
-    return res.json({
-      success: true,
-      data: {
-        voiceId,
-        name: preferredName,
-        label: `${preferredName} (我的)`,
-        type: 'custom',
-        createdAt: newVoice.createdAt
-      }
-    })
-  } catch (err) {
-    console.error('[family/tts/enroll] 异常:', err)
-    return res.status(500).json({ success: false, error: '音色注册异常' })
-  }
-})
-
-/**
- * 获取所有可用音色（预置 + 自定义）
+ * 获取所有可用音色（仅 Edge TTS 免费音色）
  * GET /family/tts-voices
  */
 router.get('/tts-voices', (req, res) => {
-  // Edge TTS 始终可用（免费，无需 API Key）
-  const edgeAvailable = true
-  // 语音克隆仅在配置了 API Key 时可用
-  const cloneAvailable = !!(config.dashscopeApiKey && config.dashscopeWorkspaceId)
-  // 语音克隆是否需要密码
-  const cloneNeedPassword = !!config.voiceClonePassword
-  const customVoices = loadCustomVoices()
-
-  // 将自定义音色转为前端格式
-  const customVoiceList = customVoices.map(v => ({
-    id: v.id,
-    label: `${v.name} (我的)`,
-    desc: '自定义克隆音色',
-    type: 'custom',
-    createdAt: v.createdAt,
-    voiceId: v.id
-  }))
-
   return res.json({
     success: true,
     data: {
-      ttsAvailable: edgeAvailable,          // Edge TTS 始终可用
-      cloneAvailable,                        // 语音克隆是否配置
-      cloneNeedPassword,                     // 语音克隆是否需要密码
-      defaultVoice: 'zh-CN-YunjianNeural',  // Edge TTS 默认音色：云健
-      presetVoices: EDGE_VOICES,             // Edge TTS 免费音色列表
-      customVoices: customVoiceList,         // 用户自定义音色
-      allVoices: [
-        ...EDGE_VOICES,
-        ...customVoiceList
-      ]
+      ttsAvailable: true,                      // Edge TTS 始终可用（免费，无需 API Key）
+      defaultVoice: 'zh-CN-YunjianNeural',     // Edge TTS 默认音色：云健
+      presetVoices: EDGE_VOICES,               // Edge TTS 免费音色列表
+      allVoices: EDGE_VOICES
     }
   })
 })
 
-/**
- * 删除自定义音色
- * DELETE /family/tts/voice/:voiceId
- */
-router.delete('/tts/voice/:voiceId', (req, res) => {
-  try {
-    const { voiceId } = req.params
-    const customVoices = loadCustomVoices()
-    const idx = customVoices.findIndex(v => v.id === voiceId)
+// ==================== 我的声音（用户录音/上传） ====================
 
-    if (idx === -1) {
-      return res.status(404).json({ success: false, error: '音色不存在' })
+// 用户专属声音文件存储目录与元数据
+const VOICES_DIR = join(__dirname, '..', 'data', 'voices')
+const VOICES_META_PATH = join(__dirname, '..', 'data', 'voices.json')
+// 文件 URL 前缀需与前端 API_BASE（/staticTool/api/family）保持一致
+const VOICE_FILE_BASE = '/staticTool/api/family'
+
+// 支持的音频格式 → Content-Type
+const VOICE_MIME = {
+  mp3: 'audio/mpeg',
+  wav: 'audio/wav',
+  ogg: 'audio/ogg',
+  webm: 'audio/webm',
+  m4a: 'audio/mp4',
+  aac: 'audio/aac',
+  opus: 'audio/ogg'
+}
+
+function loadVoicesMeta() {
+  try {
+    if (existsSync(VOICES_META_PATH)) {
+      return JSON.parse(readFileSync(VOICES_META_PATH, 'utf-8'))
+    }
+  } catch (e) { console.error('[family/voices] 读取元数据失败:', e) }
+  return []
+}
+
+function saveVoicesMeta(list) {
+  try {
+    mkdirSync(dirname(VOICES_META_PATH), { recursive: true })
+    writeFileSync(VOICES_META_PATH, JSON.stringify(list, null, 2), 'utf-8')
+  } catch (e) { console.error('[family/voices] 保存元数据失败:', e) }
+}
+
+/** 列出用户声音（仅返回元信息，音频通过 /voices/file/:filename 获取） */
+router.get('/voices', (req, res) => {
+  const list = loadVoicesMeta()
+  res.json({
+    success: true,
+    data: list.map(v => ({
+      id: v.id,
+      name: v.name,
+      url: `${VOICE_FILE_BASE}/voices/file/${v.filename}`,
+      size: v.size || 0,
+      duration: v.duration || 0,
+      createdAt: v.createdAt || null
+    }))
+  })
+})
+
+/** 新增用户声音（录音或上传），音频以 base64 传入 */
+router.post('/voices', (req, res) => {
+  try {
+    const { name, audio, format } = req.body
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ success: false, error: '请填写声音名称' })
+    }
+    if (!audio || typeof audio !== 'string') {
+      return res.status(400).json({ success: false, error: '缺少音频数据' })
     }
 
-    const removed = customVoices.splice(idx, 1)[0]
-    saveCustomVoices(customVoices)
+    const ext = (format || 'mp3').toString().toLowerCase().replace(/[^a-z0-9]/g, '')
+    if (!VOICE_MIME[ext]) {
+      return res.status(400).json({ success: false, error: `不支持的音频格式：${format || '未知'}` })
+    }
 
-    console.log(`[family/tts/voice] 已删除音色: ${removed.name} (${voiceId})`)
+    mkdirSync(VOICES_DIR, { recursive: true })
+    const id = crypto.randomUUID()
+    const filename = `${id}.${ext}`
+    const filePath = join(VOICES_DIR, filename)
 
-    return res.json({ success: true, data: { deleted: voiceId } })
-  } catch (err) {
-    console.error('[family/tts/voice] 删除失败:', err)
-    return res.status(500).json({ success: false, error: '删除音色失败' })
+    // 去除可能的 data URI 前缀
+    const base64 = audio.includes(',') ? audio.split(',')[1] : audio
+    let buf
+    try {
+      buf = Buffer.from(base64, 'base64')
+    } catch (e) {
+      return res.status(400).json({ success: false, error: '音频数据无效' })
+    }
+    if (buf.length === 0) {
+      return res.status(400).json({ success: false, error: '音频内容为空' })
+    }
+
+    writeFileSync(filePath, buf)
+
+    const meta = {
+      id,
+      name: name.trim().slice(0, 40),
+      filename,
+      size: buf.length,
+      duration: Number(req.body.duration) || 0,
+      createdAt: new Date().toISOString()
+    }
+    const list = loadVoicesMeta()
+    list.push(meta)
+    saveVoicesMeta(list)
+
+    console.log(`[family/voices] 新增声音: ${meta.name} (${filename}, ${buf.length} bytes)`)
+
+    res.json({
+      success: true,
+      data: {
+        id,
+        name: meta.name,
+        url: `${VOICE_FILE_BASE}/voices/file/${filename}`,
+        size: meta.size,
+        duration: meta.duration
+      }
+    })
+  } catch (e) {
+    console.error('[family/voices] 上传失败:', e)
+    res.status(500).json({ success: false, error: '保存失败' })
   }
+})
+
+/** 删除用户声音 */
+router.delete('/voices/:id', (req, res) => {
+  try {
+    const { id } = req.params
+    const list = loadVoicesMeta()
+    const idx = list.findIndex(v => v.id === id)
+    if (idx === -1) return res.status(404).json({ success: false, error: '声音不存在' })
+
+    const removed = list.splice(idx, 1)[0]
+    saveVoicesMeta(list)
+
+    try {
+      const p = join(VOICES_DIR, removed.filename)
+      if (existsSync(p)) unlinkSync(p)
+    } catch (e) { console.error('[family/voices] 删除文件失败:', e) }
+
+    res.json({ success: true })
+  } catch (e) {
+    console.error('[family/voices] 删除失败:', e)
+    res.status(500).json({ success: false, error: '删除失败' })
+  }
+})
+
+/** 提供用户声音音频文件（支持 Range 以兼容浏览器拖动进度） */
+router.get('/voices/file/:filename', (req, res) => {
+  const filename = req.params.filename
+  // 防目录穿越
+  if (filename.includes('/') || filename.includes('\\') || filename.includes('..')) {
+    return res.status(400).end()
+  }
+  const filePath = join(VOICES_DIR, filename)
+  if (!existsSync(filePath)) return res.status(404).end()
+
+  const ext = extname(filename).slice(1).toLowerCase()
+  const contentType = VOICE_MIME[ext] || 'application/octet-stream'
+  const total = statSync(filePath).size
+  const range = req.headers.range
+
+  res.setHeader('Content-Type', contentType)
+  res.setHeader('Accept-Ranges', 'bytes')
+
+  if (range) {
+    const m = /bytes=(\d+)-(\d*)/.exec(range)
+    if (m) {
+      const start = parseInt(m[1], 10)
+      const end = m[2] ? parseInt(m[2], 10) : total - 1
+      if (start >= total) {
+        res.status(416).setHeader('Content-Range', `bytes */${total}`)
+        return res.end()
+      }
+      const clampedEnd = Math.min(end, total - 1)
+      res.status(206)
+      res.setHeader('Content-Range', `bytes ${start}-${clampedEnd}/${total}`)
+      res.setHeader('Content-Length', clampedEnd - start + 1)
+      const stream = createReadStream(filePath, { start, end: clampedEnd })
+      stream.on('error', () => res.status(500).end())
+      stream.pipe(res)
+      return
+    }
+  }
+
+  res.setHeader('Content-Length', total)
+  const full = createReadStream(filePath)
+  full.on('error', () => res.status(500).end())
+  full.pipe(res)
 })
 
 export default router
