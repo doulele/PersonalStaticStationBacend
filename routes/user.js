@@ -1,10 +1,12 @@
 import { Router } from 'express'
+import jwt from 'jsonwebtoken'
 import crypto from 'crypto'
 import fs from 'fs'
 import path from 'path'
 
 const router = Router()
 
+const JWT_SECRET = process.env.JWT_SECRET || 'static-tool-jwt-secret-2024'
 const DATA_DIR = path.join(process.cwd(), 'data')
 const USERS_FILE = path.join(DATA_DIR, 'users.json')
 const PLANS_FILE = path.join(DATA_DIR, 'user_plans.json')
@@ -16,23 +18,38 @@ if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, '{}', 'utf-8')
 if (!fs.existsSync(PLANS_FILE)) fs.writeFileSync(PLANS_FILE, '[]', 'utf-8')
 if (!fs.existsSync(PREFS_FILE)) fs.writeFileSync(PREFS_FILE, '{}', 'utf-8')
 
-// 简单 token 生成
+// 简单 token 生成（旧系统兼容）
 function generateToken(userId, pin) {
   return crypto.createHash('sha256').update(`${userId}:${pin}:${Date.now()}`).digest('hex').slice(0, 32)
 }
 
-// 验证 token
+// 验证 token（支持 JWT Bearer Token + 旧 x-auth-token）
 function verifyToken(req) {
-  const token = req.headers['x-auth-token']
-  if (!token) return null
-  try {
-    const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'))
-    for (const [userId, user] of Object.entries(users)) {
-      if (user.tokens && user.tokens.includes(token)) {
-        return userId
+  let token = null
+
+  // 优先从 Authorization header 获取 Bearer JWT
+  const authHeader = req.headers.authorization
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    token = authHeader.slice(7)
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET)
+      return decoded.userId
+    } catch { /* JWT 无效，回退到旧方式 */ }
+  }
+
+  // 兼容旧的 x-auth-token
+  token = req.headers['x-auth-token']
+  if (token) {
+    try {
+      const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'))
+      for (const [userId, user] of Object.entries(users)) {
+        if (user.tokens && user.tokens.includes(token)) {
+          return userId
+        }
       }
-    }
-  } catch { /* ignore */ }
+    } catch { /* ignore */ }
+  }
+
   return null
 }
 

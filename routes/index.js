@@ -8,6 +8,7 @@ import ocrRoutes from './ocr.js'
 import analysisRoutes from './analysis.js'
 import travelGuideRoutes from './travelGuide.js'
 import userRoutes from './user.js'
+import authRoutes from './auth.js'
 import statsRoutes from './stats.js'
 import oilPriceRoutes from './oilPrice.js'
 import familyRoutes from './family.js'
@@ -34,6 +35,7 @@ router.use('/ocr', ocrRoutes)
 router.use('/analysis', analysisRoutes)
 router.use('/travel', travelGuideRoutes)
 router.use('/user', userRoutes)
+router.use('/auth', authRoutes)
 router.use('/stats', statsRoutes)
 router.use('/oil-price', oilPriceRoutes)
 router.use('/family', familyRoutes)

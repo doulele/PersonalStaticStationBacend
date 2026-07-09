@@ -1,10 +1,15 @@
 {
   "/home/fund/stock-detail": 1,
-  "/home/lifeServices/weather": 3,
-  "/home/fund/fund-search": 8,
-  "/home/lifeServices/oilPrice": 4,
-  "/home/fund/stock-filter": 1,
-  "/home/familyEducation/babySleep": 6,
-  "/home/fund/fund-filter": 4,
-  "/home/audioVideoImagesTools/vipVideoParse": 1
+  "/home/lifeServices/weather": 9,
+  "/home/fund/fund-search": 16,
+  "/home/lifeServices/oilPrice": 10,
+  "/home/fund/stock-filter": 8,
+  "/home/familyEducation/babySleep": 11,
+  "/home/fund/fund-filter": 9,
+  "/home/audioVideoImagesTools/vipVideoParse": 16,
+  "/home/audioVideoImagesTools/novelOnline": 9,
+  "/home/audioVideoImagesTools/imageTools": 3,
+  "/home/lifeServices/lottery": 8,
+  "/home/lifeServices/travelGuide": 5,
+  "/home/lifeServices/travelMemo": 5
 }
