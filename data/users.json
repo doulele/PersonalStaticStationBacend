@@ -1,1 +1,12 @@
-{}
+{
+  "u_1783921184125_qmg2": {
+    "userId": "u_1783921184125_qmg2",
+    "email": "1220736335@qq.com",
+    "passwordHash": "$2b$10$87/ediVHweZ2t13yEhDEPOcU8VPyeXdjXajF7lxD4TZpuDN97s3qC",
+    "nickname": "admin",
+    "pinHash": null,
+    "createdAt": "2026-07-13T05:39:44.272Z",
+    "lastLogin": "2026-07-13T05:39:44.272Z",
+    "tokens": []
+  }
+}

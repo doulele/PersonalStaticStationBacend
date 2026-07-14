@@ -1,0 +1,106 @@
+{
+  "family": {
+    "id": "f_mrin8zttn2q106",
+    "name": "测试会议",
+    "adminId": "u_mrin8ztt992ipg"
+  },
+  "members": [
+    {
+      "id": "u_mrin8ztt992ipg",
+      "name": "爸爸",
+      "role": "admin"
+    }
+  ],
+  "currentUserId": "u_mrin8ztt992ipg",
+  "meetings": [
+    {
+      "id": "m_mriswcnzwit3r4",
+      "familyId": "f_mrin8zttn2q106",
+      "title": "新增会议",
+      "date": "2026-07-13",
+      "status": "closed",
+      "participants": [
+        "u_mrin8ztt992ipg"
+      ],
+      "visibility": "normal",
+      "encrypted": true,
+      "encryptPass": "123456",
+      "agendaLocked": false,
+      "createdAt": "2026-07-13T05:47:43.007Z"
+    },
+    {
+      "id": "m_mrit6fd5qy0vcy",
+      "familyId": "f_mrin8zttn2q106",
+      "title": "测试最新议题",
+      "date": "2026-07-13",
+      "status": "active",
+      "participants": [
+        "u_mrin8ztt992ipg"
+      ],
+      "visibility": "normal",
+      "encrypted": false,
+      "encryptPass": "",
+      "agendaLocked": false,
+      "createdAt": "2026-07-13T05:55:33.065Z"
+    }
+  ],
+  "agendaItems": [
+    {
+      "id": "a_mrit0fgt3kyfj1",
+      "meetingId": "m_mriswcnzwit3r4",
+      "authorId": "u_mrin8ztt992ipg",
+      "title": "这是一个小议题",
+      "category": "家庭事务",
+      "desc": "",
+      "priority": 2,
+      "resonance": [
+        "u_mrin8ztt992ipg"
+      ],
+      "emotionLevel": 50,
+      "createdAt": "2026-07-13T05:50:53.261Z"
+    },
+    {
+      "id": "a_mrit7bwli5g1kq",
+      "meetingId": "m_mrit6fd5qy0vcy",
+      "authorId": "u_mrin8ztt992ipg",
+      "title": "这是一个测试标题",
+      "category": "家庭事务",
+      "desc": "测试一下",
+      "priority": 2,
+      "resonance": [],
+      "emotionLevel": 58,
+      "createdAt": "2026-07-13T05:56:15.237Z"
+    }
+  ],
+  "records": [
+    {
+      "id": "r_mrisytkzqp4n7o",
+      "meetingId": "m_mriswcnzwit3r4",
+      "seq": 1,
+      "timestamp": "13:49:38",
+      "speakerId": "u_mrin8ztt992ipg",
+      "content": "这是测试文本记录的",
+      "autoTags": [],
+      "manualTags": [],
+      "createdAt": "2026-07-13T05:49:38.244Z"
+    }
+  ],
+  "patches": [],
+  "tasks": [],
+  "emotionLogs": [
+    {
+      "id": "e_mrit7436wk4vce",
+      "userId": "u_mrin8ztt992ipg",
+      "meetingId": "m_mrit6fd5qy0vcy",
+      "level": 69,
+      "note": "",
+      "createdAt": "2026-07-13T05:56:05.106Z"
+    }
+  ],
+  "settings": {
+    "autoDeleteAudio": true,
+    "hotwords": "决定,结论,先搁置,行动项,待定",
+    "transcribeMode": "mock",
+    "backendUrl": ""
+  }
+}

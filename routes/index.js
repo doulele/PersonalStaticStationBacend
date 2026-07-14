@@ -12,6 +12,7 @@ import authRoutes from './auth.js'
 import statsRoutes from './stats.js'
 import oilPriceRoutes from './oilPrice.js'
 import familyRoutes from './family.js'
+import familyMeetingRoutes from './familyMeeting.js'
 import videoParseRoutes from './videoParse.js'
 
 const router = Router()
@@ -39,6 +40,7 @@ router.use('/auth', authRoutes)
 router.use('/stats', statsRoutes)
 router.use('/oil-price', oilPriceRoutes)
 router.use('/family', familyRoutes)
+router.use('/family-meeting', familyMeetingRoutes)
 router.use('/video-parse', videoParseRoutes)
 
 // 健康检查
