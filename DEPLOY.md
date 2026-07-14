@@ -41,6 +41,12 @@ npm install -g pm2
 pm2 -v    # 确认安装成功
 ```
 
+### 4. 数据库说明 ⚠️
+
+本项目使用 **SQLite**（`sql.js` 纯 JS 实现），零依赖零编译，**不需要安装任何数据库服务**。数据存储在 `data/app.db` 文件中。
+
+> 📌 `sql.js` 基于 WebAssembly，无需 Python、node-gyp 或 C++ 编译工具。
+
 ---
 
 ## 二、上传后端代码
@@ -61,12 +67,13 @@ pm2 -v    # 确认安装成功
    routes/
    services/
    middlewares/
+   data/app.db    ← SQLite 数据库文件（⚠️ 首次部署必须上传）
 
 ❌ 不要上传：
-   .env          ← 含密钥，必须在服务器上手动创建
-   node_modules/ ← 上传后重新 npm install
-   .gitignore    ← 不需要
-   DEPLOY.md     ← 不需要
+   .env           ← 含密钥，必须在服务器上手动创建
+   node_modules/  ← 上传后重新 npm install
+   .gitignore     ← 不需要
+   DEPLOY.md      ← 不需要
 ```
 
 > 💡 **技巧**：先在本地把 `.env` 临时移出项目目录，上传完毕后再移回来，这样就不会误上传。
@@ -83,13 +90,17 @@ npm install
 /www/wwwroot/node/staticTool/
 ├── app.js
 ├── package.json
-├── ecosystem.config.js
+├── ecosystem.config.cjs
 ├── node_modules/     ← npm install 生成的
 ├── config/
 ├── routes/
 ├── services/
-└── middlewares/
+├── middlewares/
+└── data/
+    └── app.db        ← SQLite 数据库（⚠️ 日常更新不要覆盖此文件！）
 ```
+
+> ⚠️ **日常更新时，只上传代码文件，不要覆盖 `data/app.db`！** 否则会丢失线上数据。如需更新数据库内容，在服务器上直接操作。
 
 ---
 
@@ -245,6 +256,8 @@ pm2 logs statictool-api --lines 50  # 最近 50 行
 
 ### 1. 上传更新文件（Xftp）
 直接拖拽覆盖对应的文件（如修改了 `routes/lottery.js` 就只上传这个文件）。
+
+**⚠️ 重要：不要上传 `data/app.db`！** 否则会覆盖线上数据库，丢失用户数据。
 
 ### 2. 重启服务（Xshell）
 ```bash

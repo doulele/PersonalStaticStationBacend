@@ -1,22 +1,11 @@
 import { Router } from 'express'
 import jwt from 'jsonwebtoken'
 import crypto from 'crypto'
-import fs from 'fs'
-import path from 'path'
+import { dbGet, dbAll, dbRun } from '../services/db.js'
 
 const router = Router()
 
 const JWT_SECRET = process.env.JWT_SECRET || 'static-tool-jwt-secret-2024'
-const DATA_DIR = path.join(process.cwd(), 'data')
-const USERS_FILE = path.join(DATA_DIR, 'users.json')
-const PLANS_FILE = path.join(DATA_DIR, 'user_plans.json')
-const PREFS_FILE = path.join(DATA_DIR, 'user_preferences.json')
-
-// 初始化
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true })
-if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, '{}', 'utf-8')
-if (!fs.existsSync(PLANS_FILE)) fs.writeFileSync(PLANS_FILE, '[]', 'utf-8')
-if (!fs.existsSync(PREFS_FILE)) fs.writeFileSync(PREFS_FILE, '{}', 'utf-8')
 
 // 简单 token 生成（旧系统兼容）
 function generateToken(userId, pin) {
@@ -41,11 +30,10 @@ function verifyToken(req) {
   token = req.headers['x-auth-token']
   if (token) {
     try {
-      const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'))
-      for (const [userId, user] of Object.entries(users)) {
-        if (user.tokens && user.tokens.includes(token)) {
-          return userId
-        }
+      const rows = dbAll('SELECT userId, tokens FROM users')
+      for (const row of rows) {
+        const tokens = JSON.parse(row.tokens || '[]')
+        if (tokens.includes(token)) return row.userId
       }
     } catch { /* ignore */ }
   }
@@ -58,7 +46,6 @@ function verifyToken(req) {
 /**
  * POST /user/identify
  * 昵称 + 4位PIN 身份标识，返回 token
- * Body: { nickname, pin }
  */
 router.post('/identify', (req, res) => {
   try {
@@ -67,31 +54,38 @@ router.post('/identify', (req, res) => {
       return res.status(400).json({ error: '请提供昵称和4位数字PIN' })
     }
 
-    const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'))
+    const pinHash = crypto.createHash('sha256').update(pin).digest('hex')
 
     // 查找已有用户（昵称+PIN匹配）
-    let userId = Object.keys(users).find(uid => {
-      const u = users[uid]
-      return u.nickname === nickname && u.pinHash === crypto.createHash('sha256').update(pin).digest('hex')
-    })
+    let user = dbGet(
+      'SELECT * FROM users WHERE nickname = ? AND pinHash = ?',
+      [nickname, pinHash]
+    )
 
-    if (!userId) {
+    let userId
+    if (!user) {
       // 新用户注册
       userId = `u_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
-      users[userId] = {
-        userId,
-        nickname,
-        pinHash: crypto.createHash('sha256').update(pin).digest('hex'),
-        createdAt: new Date().toISOString(),
-        tokens: []
-      }
+      const now = new Date().toISOString()
+      dbRun(
+        'INSERT INTO users (userId, email, passwordHash, nickname, pinHash, createdAt, lastLogin, tokens) VALUES (?,?,?,?,?,?,?,?)',
+        [userId, null, null, nickname, pinHash, now, now, '[]']
+      )
+    } else {
+      userId = user.userId
     }
 
     const token = generateToken(userId, pin)
-    users[userId].tokens = [...(users[userId].tokens || []), token].slice(-5) // 保留最近5个token
-    users[userId].lastLogin = new Date().toISOString()
 
-    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf-8')
+    // 更新 tokens（保留最近5个）
+    const currentUser = dbGet('SELECT tokens FROM users WHERE userId = ?', [userId])
+    const currentTokens = JSON.parse(currentUser.tokens || '[]')
+    const newTokens = [...currentTokens, token].slice(-5)
+
+    dbRun(
+      'UPDATE users SET tokens = ?, lastLogin = ? WHERE userId = ?',
+      [JSON.stringify(newTokens), new Date().toISOString(), userId]
+    )
 
     res.json({ success: true, data: { token, userId, nickname } })
   } catch (err) {
@@ -105,24 +99,22 @@ router.post('/identify', (req, res) => {
 /**
  * GET /user/plans
  * 获取用户所有行程
- * Headers: x-auth-token
  */
 router.get('/plans', (req, res) => {
   try {
     const userId = verifyToken(req)
     if (!userId) return res.status(401).json({ error: '请先进行身份标识' })
 
-    const allPlans = JSON.parse(fs.readFileSync(PLANS_FILE, 'utf-8'))
-    const userPlans = allPlans.filter(p => p.userId === userId)
-    userPlans.sort((a, b) => new Date(b.savedAt) - new Date(a.savedAt))
+    const plans = dbAll(
+      'SELECT planId, planName, userId, savedAt, summary FROM user_plans WHERE userId = ? ORDER BY savedAt DESC',
+      [userId]
+    )
 
     res.json({
       success: true,
-      data: userPlans.map(p => ({
-        planId: p.planId,
-        planName: p.planName,
-        savedAt: p.savedAt,
-        summary: p.summary
+      data: plans.map(p => ({
+        ...p,
+        summary: tryParse(p.summary)
       }))
     })
   } catch (err) {
@@ -134,8 +126,6 @@ router.get('/plans', (req, res) => {
 /**
  * POST /user/plans
  * 保存行程
- * Headers: x-auth-token
- * Body: { planName, planData }
  */
 router.post('/plans', (req, res) => {
   try {
@@ -145,21 +135,15 @@ router.post('/plans', (req, res) => {
     const { planName, planData } = req.body
     if (!planName || !planData) return res.status(400).json({ error: '缺少行程名称或数据' })
 
-    const allPlans = JSON.parse(fs.readFileSync(PLANS_FILE, 'utf-8'))
     const planId = `plan_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
-    const record = {
-      planId,
-      planName,
-      userId,
-      planData,
-      savedAt: new Date().toISOString(),
-      summary: planData.summary || {}
-    }
+    const now = new Date().toISOString()
 
-    allPlans.push(record)
-    fs.writeFileSync(PLANS_FILE, JSON.stringify(allPlans, null, 2), 'utf-8')
+    dbRun(
+      'INSERT INTO user_plans (planId, planName, userId, planData, savedAt, summary) VALUES (?,?,?,?,?,?)',
+      [planId, planName, userId, JSON.stringify(planData), now, JSON.stringify(planData.summary || {})]
+    )
 
-    res.json({ success: true, data: { planId, savedAt: record.savedAt } })
+    res.json({ success: true, data: { planId, savedAt: now } })
   } catch (err) {
     console.error('[User] 保存行程失败:', err.message)
     res.status(500).json({ error: '保存失败' })
@@ -169,7 +153,6 @@ router.post('/plans', (req, res) => {
 /**
  * DELETE /user/plans/:id
  * 删除行程
- * Headers: x-auth-token
  */
 router.delete('/plans/:id', (req, res) => {
   try {
@@ -177,12 +160,11 @@ router.delete('/plans/:id', (req, res) => {
     if (!userId) return res.status(401).json({ error: '请先进行身份标识' })
 
     const { id } = req.params
-    const allPlans = JSON.parse(fs.readFileSync(PLANS_FILE, 'utf-8'))
-    const idx = allPlans.findIndex(p => p.planId === id && p.userId === userId)
-    if (idx === -1) return res.status(404).json({ error: '行程不存在' })
-
-    allPlans.splice(idx, 1)
-    fs.writeFileSync(PLANS_FILE, JSON.stringify(allPlans, null, 2), 'utf-8')
+    const result = dbRun(
+      'DELETE FROM user_plans WHERE planId = ? AND userId = ?',
+      [id, userId]
+    )
+    if (result.changes === 0) return res.status(404).json({ error: '行程不存在' })
 
     res.json({ success: true })
   } catch (err) {
@@ -195,23 +177,26 @@ router.delete('/plans/:id', (req, res) => {
 
 /**
  * GET /user/preferences
- * 获取用户偏好
- * Headers: x-auth-token
  */
 router.get('/preferences', (req, res) => {
   try {
     const userId = verifyToken(req)
     if (!userId) return res.status(401).json({ error: '请先进行身份标识' })
 
-    const prefs = JSON.parse(fs.readFileSync(PREFS_FILE, 'utf-8'))
-    const userPrefs = prefs[userId] || {
-      preferredTypes: [],      // ['自然', '人文', '网红']
-      budgetLevel: 'medium',   // 'low' | 'medium' | 'high'
-      preferredFoodTypes: [],  // ['中餐', '西餐', '小吃']
-      stayCorrectionFactor: 1.0 // 停留时间修正系数
+    const pref = dbGet('SELECT * FROM user_preferences WHERE userId = ?', [userId])
+    const data = pref ? {
+      preferredTypes: tryParse(pref.preferredTypes, []),
+      budgetLevel: pref.budgetLevel || 'medium',
+      preferredFoodTypes: tryParse(pref.preferredFoodTypes, []),
+      stayCorrectionFactor: pref.stayCorrectionFactor || 1.0
+    } : {
+      preferredTypes: [],
+      budgetLevel: 'medium',
+      preferredFoodTypes: [],
+      stayCorrectionFactor: 1.0
     }
 
-    res.json({ success: true, data: userPrefs })
+    res.json({ success: true, data })
   } catch (err) {
     console.error('[User] 获取偏好失败:', err.message)
     res.status(500).json({ error: '获取偏好失败' })
@@ -220,9 +205,6 @@ router.get('/preferences', (req, res) => {
 
 /**
  * POST /user/preferences
- * 保存用户偏好
- * Headers: x-auth-token
- * Body: { preferredTypes, budgetLevel, preferredFoodTypes, stayCorrectionFactor }
  */
 router.post('/preferences', (req, res) => {
   try {
@@ -230,22 +212,47 @@ router.post('/preferences', (req, res) => {
     if (!userId) return res.status(401).json({ error: '请先进行身份标识' })
 
     const { preferredTypes, budgetLevel, preferredFoodTypes, stayCorrectionFactor } = req.body
-    const prefs = JSON.parse(fs.readFileSync(PREFS_FILE, 'utf-8'))
+    const now = new Date().toISOString()
 
-    prefs[userId] = {
-      preferredTypes: preferredTypes || [],
-      budgetLevel: budgetLevel || 'medium',
-      preferredFoodTypes: preferredFoodTypes || [],
-      stayCorrectionFactor: stayCorrectionFactor || 1.0,
-      updatedAt: new Date().toISOString()
-    }
+    dbRun(
+      `INSERT INTO user_preferences (userId, preferredTypes, budgetLevel, preferredFoodTypes, stayCorrectionFactor, updatedAt)
+       VALUES (?,?,?,?,?,?)
+       ON CONFLICT(userId) DO UPDATE SET
+         preferredTypes=excluded.preferredTypes,
+         budgetLevel=excluded.budgetLevel,
+         preferredFoodTypes=excluded.preferredFoodTypes,
+         stayCorrectionFactor=excluded.stayCorrectionFactor,
+         updatedAt=excluded.updatedAt`,
+      [
+        userId,
+        JSON.stringify(preferredTypes || []),
+        budgetLevel || 'medium',
+        JSON.stringify(preferredFoodTypes || []),
+        stayCorrectionFactor || 1.0,
+        now
+      ]
+    )
 
-    fs.writeFileSync(PREFS_FILE, JSON.stringify(prefs, null, 2), 'utf-8')
-    res.json({ success: true, data: prefs[userId] })
+    res.json({
+      success: true,
+      data: {
+        preferredTypes: preferredTypes || [],
+        budgetLevel: budgetLevel || 'medium',
+        preferredFoodTypes: preferredFoodTypes || [],
+        stayCorrectionFactor: stayCorrectionFactor || 1.0,
+        updatedAt: now
+      }
+    })
   } catch (err) {
     console.error('[User] 保存偏好失败:', err.message)
     res.status(500).json({ error: '保存偏好失败' })
   }
 })
+
+// ==================== 辅助 ====================
+
+function tryParse(str, defaultValue) {
+  try { return JSON.parse(str) } catch { return defaultValue }
+}
 
 export default router

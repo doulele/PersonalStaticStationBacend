@@ -1,37 +1,26 @@
 import { Router } from 'express'
 import bcrypt from 'bcryptjs'
 import crypto from 'crypto'
-import fs from 'fs'
-import path from 'path'
 import nodemailer from 'nodemailer'
-
-import { authRequired, generateJwt, USERS_FILE } from '../middlewares/auth.js'
+import { authRequired, generateJwt } from '../middlewares/auth.js'
+import { dbGet, dbRun } from '../services/db.js'
 
 const router = Router()
 
-// 确保 data 目录存在（与 user.js 共用）
-const DATA_DIR = path.join(process.cwd(), 'data')
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true })
-if (!fs.existsSync(USERS_FILE)) fs.writeFileSync(USERS_FILE, '{}', 'utf-8')
-
 // ==================== 验证码存储（内存，重启后清空） ====================
-// { email: { code, expiresAt, attempts } }
 const resetCodeStore = new Map()
-const CODE_EXPIRY_MS = 10 * 60 * 1000  // 验证码有效期 10 分钟
-const CODE_MAX_ATTEMPTS = 5             // 最大尝试次数
-const RESEND_COOLDOWN_MS = 60 * 1000    // 重新发送冷却 60 秒
+const CODE_EXPIRY_MS = 10 * 60 * 1000
+const CODE_MAX_ATTEMPTS = 5
+const RESEND_COOLDOWN_MS = 60 * 1000
 
-// 清理过期验证码（定时任务）
 setInterval(() => {
   const now = Date.now()
   for (const [email, data] of resetCodeStore.entries()) {
-    if (data.expiresAt < now) {
-      resetCodeStore.delete(email)
-    }
+    if (data.expiresAt < now) resetCodeStore.delete(email)
   }
 }, 60 * 1000)
 
-// ==================== 邮件发送器（可选） ====================
+// ==================== 邮件发送器 ====================
 let transporter = null
 
 function initMailTransporter() {
@@ -41,11 +30,8 @@ function initMailTransporter() {
       transporter = nodemailer.createTransport({
         host: SMTP_HOST,
         port: Number(SMTP_PORT) || 465,
-        secure: true, // 465 端口使用 SSL
-        auth: {
-          user: SMTP_USER,
-          pass: SMTP_PASS
-        }
+        secure: true,
+        auth: { user: SMTP_USER, pass: SMTP_PASS }
       })
       console.log('[Mail] SMTP 邮件服务已初始化:', SMTP_HOST)
     } catch (err) {
@@ -56,10 +42,8 @@ function initMailTransporter() {
   }
 }
 
-// 发送验证码邮件（或打印到控制台）
 async function sendResetCode(email, code) {
   const smtpFrom = process.env.SMTP_FROM || process.env.SMTP_USER || 'noreply@toolhub.com'
-  
   if (transporter) {
     await transporter.sendMail({
       from: smtpFrom,
@@ -68,9 +52,7 @@ async function sendResetCode(email, code) {
       html: `
         <div style="max-width:480px;margin:0 auto;padding:24px;font-family:Arial,sans-serif;background:#f8f9fa;border-radius:8px">
           <h2 style="color:#7c3aed;margin:0 0 16px">ToolHub 密码重置</h2>
-          <p style="color:#333;font-size:15px;line-height:1.6">
-            您正在为账号 <strong>${email}</strong> 重置密码，验证码如下：
-          </p>
+          <p style="color:#333;font-size:15px;line-height:1.6">您正在为账号 <strong>${email}</strong> 重置密码，验证码如下：</p>
           <div style="text-align:center;margin:24px 0">
             <span style="display:inline-block;font-size:32px;font-weight:bold;letter-spacing:6px;color:#7c3aed;background:#ede9fe;padding:12px 28px;border-radius:8px">${code}</span>
           </div>
@@ -80,7 +62,6 @@ async function sendResetCode(email, code) {
       `
     })
   } else {
-    // 开发模式：打印到控制台
     console.log(`\n🔑 [忘记密码] 验证码已生成`)
     console.log(`   邮箱: ${email}`)
     console.log(`   验证码: ${code}`)
@@ -88,8 +69,14 @@ async function sendResetCode(email, code) {
   }
 }
 
-// 应用启动时初始化邮件服务
 initMailTransporter()
+
+// ==================== 辅助函数 ====================
+
+/** 根据邮箱查找用户 */
+function findUserByEmail(email) {
+  return dbGet('SELECT * FROM users WHERE email = ?', [email])
+}
 
 // ==================== 注册 ====================
 
@@ -99,11 +86,10 @@ initMailTransporter()
  */
 router.post('/register', (req, res) => {
   try {
-    const { email, password, nickname } = req.body
+    const { email, password, nickname, inviteCode } = req.body
 
-    // 参数校验
-    if (!email || !password || !nickname) {
-      return res.status(400).json({ error: '请填写邮箱、密码和昵称' })
+    if (!email || !password || !nickname || !inviteCode) {
+      return res.status(400).json({ error: '请填写所有必填项（含邀请码）' })
     }
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return res.status(400).json({ error: '请提供有效的邮箱地址' })
@@ -115,11 +101,18 @@ router.post('/register', (req, res) => {
       return res.status(400).json({ error: '昵称长度应为2-20个字符' })
     }
 
-    const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'))
+    // 验证邀请码
+    const validInviteCode = process.env.INVITE_CODE
+    if (!validInviteCode) {
+      console.error('[Auth] 服务端未配置 INVITE_CODE 环境变量')
+      return res.status(500).json({ error: '注册功能暂不可用' })
+    }
+    if (inviteCode !== validInviteCode) {
+      return res.status(403).json({ error: '邀请码错误，无法注册' })
+    }
 
     // 检查邮箱是否已被注册
-    const existingUser = Object.values(users).find(u => u.email === email)
-    if (existingUser) {
+    if (findUserByEmail(email)) {
       return res.status(409).json({ error: '该邮箱已被注册' })
     }
 
@@ -127,32 +120,18 @@ router.post('/register', (req, res) => {
     const userId = `u_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
     const salt = bcrypt.genSaltSync(10)
     const passwordHash = bcrypt.hashSync(password, salt)
+    const now = new Date().toISOString()
 
-    users[userId] = {
-      userId,
-      email,
-      passwordHash,
-      nickname,
-      pinHash: null,           // 旧系统兼容字段
-      createdAt: new Date().toISOString(),
-      lastLogin: new Date().toISOString(),
-      tokens: []               // 旧系统兼容字段
-    }
+    dbRun(
+      'INSERT INTO users (userId, email, passwordHash, nickname, pinHash, createdAt, lastLogin, tokens) VALUES (?,?,?,?,?,?,?,?)',
+      [userId, email, passwordHash, nickname, null, now, now, '[]']
+    )
 
-    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf-8')
-
-    // 生成 JWT token
     const token = generateJwt(userId, email)
 
     res.status(201).json({
       success: true,
-      data: {
-        token,
-        userId,
-        email,
-        nickname,
-        createdAt: users[userId].createdAt
-      }
+      data: { token, userId, email, nickname, createdAt: now }
     })
   } catch (err) {
     console.error('[Auth] 注册失败:', err.message)
@@ -174,15 +153,11 @@ router.post('/login', (req, res) => {
       return res.status(400).json({ error: '请填写邮箱和密码' })
     }
 
-    const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'))
-
-    // 查找用户
-    const user = Object.values(users).find(u => u.email === email)
+    const user = findUserByEmail(email)
     if (!user) {
       return res.status(401).json({ error: '邮箱或密码错误' })
     }
 
-    // 验证密码
     if (!user.passwordHash) {
       return res.status(401).json({ error: '该账号未设置密码，请使用昵称+PIN登录' })
     }
@@ -193,11 +168,9 @@ router.post('/login', (req, res) => {
     }
 
     // 更新最后登录时间
-    user.lastLogin = new Date().toISOString()
-    users[user.userId] = user
-    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf-8')
+    const now = new Date().toISOString()
+    dbRun('UPDATE users SET lastLogin = ? WHERE userId = ?', [now, user.userId])
 
-    // 生成 JWT token
     const token = generateJwt(user.userId, user.email)
 
     res.json({
@@ -208,7 +181,7 @@ router.post('/login', (req, res) => {
         email: user.email,
         nickname: user.nickname,
         createdAt: user.createdAt,
-        lastLogin: user.lastLogin
+        lastLogin: now
       }
     })
   } catch (err) {
@@ -221,26 +194,18 @@ router.post('/login', (req, res) => {
 
 /**
  * GET /auth/profile
- * 需要认证
  */
 router.get('/profile', authRequired, (req, res) => {
   try {
-    const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'))
-    const user = users[req.userId]
+    const user = dbGet(
+      'SELECT userId, email, nickname, createdAt, lastLogin FROM users WHERE userId = ?',
+      [req.userId]
+    )
     if (!user) {
       return res.status(404).json({ error: '用户不存在' })
     }
 
-    res.json({
-      success: true,
-      data: {
-        userId: user.userId,
-        email: user.email,
-        nickname: user.nickname,
-        createdAt: user.createdAt,
-        lastLogin: user.lastLogin
-      }
-    })
+    res.json({ success: true, data: user })
   } catch (err) {
     console.error('[Auth] 获取信息失败:', err.message)
     res.status(500).json({ error: '获取用户信息失败' })
@@ -251,8 +216,6 @@ router.get('/profile', authRequired, (req, res) => {
 
 /**
  * POST /auth/change-password
- * 需要认证
- * Body: { oldPassword, newPassword }
  */
 router.post('/change-password', authRequired, (req, res) => {
   try {
@@ -265,9 +228,7 @@ router.post('/change-password', authRequired, (req, res) => {
       return res.status(400).json({ error: '新密码长度不能少于6位' })
     }
 
-    const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'))
-    const user = users[req.userId]
-
+    const user = dbGet('SELECT * FROM users WHERE userId = ?', [req.userId])
     if (!user || !user.passwordHash) {
       return res.status(400).json({ error: '该账号不支持密码修改' })
     }
@@ -278,9 +239,8 @@ router.post('/change-password', authRequired, (req, res) => {
     }
 
     const salt = bcrypt.genSaltSync(10)
-    user.passwordHash = bcrypt.hashSync(newPassword, salt)
-    users[req.userId] = user
-    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf-8')
+    const newHash = bcrypt.hashSync(newPassword, salt)
+    dbRun('UPDATE users SET passwordHash = ? WHERE userId = ?', [newHash, req.userId])
 
     res.json({ success: true, message: '密码修改成功' })
   } catch (err) {
@@ -289,53 +249,32 @@ router.post('/change-password', authRequired, (req, res) => {
   }
 })
 
-// ==================== 忘记密码 - 发送验证码 ====================
+// ==================== 忘记密码 ====================
 
-/**
- * POST /auth/forgot-password
- * Body: { email }
- * 发送 6 位验证码到邮箱
- */
 router.post('/forgot-password', async (req, res) => {
   try {
     const { email } = req.body
-
     if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       return res.status(400).json({ error: '请提供有效的邮箱地址' })
     }
 
-    const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'))
-
-    // 查找用户
-    const user = Object.values(users).find(u => u.email === email)
+    const user = findUserByEmail(email)
     if (!user) {
-      // 安全起见不暴露邮箱是否已注册，统一返回成功
-      // 但为了用户体验，这里提示邮箱未注册
       return res.status(404).json({ error: '该邮箱未注册，请先注册账号' })
     }
 
-    // 检查冷却时间
     const existing = resetCodeStore.get(email)
     if (existing && existing.sentAt && (Date.now() - existing.sentAt) < RESEND_COOLDOWN_MS) {
       const remaining = Math.ceil((RESEND_COOLDOWN_MS - (Date.now() - existing.sentAt)) / 1000)
       return res.status(429).json({ error: `请 ${remaining} 秒后再试` })
     }
 
-    // 生成 6 位数字验证码
     const code = String(Math.floor(100000 + Math.random() * 900000))
-    const expiresAt = Date.now() + CODE_EXPIRY_MS
-
-    // 存储验证码
     resetCodeStore.set(email, {
-      code,
-      expiresAt,
-      attempts: 0,
-      sentAt: Date.now()
+      code, expiresAt: Date.now() + CODE_EXPIRY_MS, attempts: 0, sentAt: Date.now()
     })
 
-    // 发送验证码
     await sendResetCode(email, code)
-
     res.json({ success: true, message: '验证码已发送到您的邮箱' })
   } catch (err) {
     console.error('[Auth] 发送验证码失败:', err.message)
@@ -343,13 +282,6 @@ router.post('/forgot-password', async (req, res) => {
   }
 })
 
-// ==================== 重置密码 ====================
-
-/**
- * POST /auth/reset-password
- * Body: { email, code, newPassword }
- * 验证验证码后重置密码
- */
 router.post('/reset-password', async (req, res) => {
   try {
     const { email, code, newPassword } = req.body
@@ -364,45 +296,30 @@ router.post('/reset-password', async (req, res) => {
       return res.status(400).json({ error: '新密码长度不能少于6位' })
     }
 
-    // 校验验证码
     const storedData = resetCodeStore.get(email)
-    if (!storedData) {
-      return res.status(400).json({ error: '请先获取验证码' })
-    }
+    if (!storedData) return res.status(400).json({ error: '请先获取验证码' })
     if (storedData.expiresAt < Date.now()) {
       resetCodeStore.delete(email)
       return res.status(400).json({ error: '验证码已过期，请重新获取' })
     }
 
-    // 增加尝试次数
     storedData.attempts++
     if (storedData.attempts > CODE_MAX_ATTEMPTS) {
       resetCodeStore.delete(email)
       return res.status(400).json({ error: '错误次数过多，请重新获取验证码' })
     }
-
     if (storedData.code !== code) {
-      return res.status(400).json({
-        error: `验证码错误，还剩 ${CODE_MAX_ATTEMPTS - storedData.attempts} 次机会`
-      })
+      return res.status(400).json({ error: `验证码错误，还剩 ${CODE_MAX_ATTEMPTS - storedData.attempts} 次机会` })
     }
 
-    // 验证码正确，更新密码
-    const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'))
-    const user = Object.values(users).find(u => u.email === email)
-
-    if (!user) {
-      return res.status(404).json({ error: '用户不存在' })
-    }
+    const user = findUserByEmail(email)
+    if (!user) return res.status(404).json({ error: '用户不存在' })
 
     const salt = bcrypt.genSaltSync(10)
-    user.passwordHash = bcrypt.hashSync(newPassword, salt)
-    users[user.userId] = user
-    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf-8')
+    dbRun('UPDATE users SET passwordHash = ? WHERE userId = ?',
+      [bcrypt.hashSync(newPassword, salt), user.userId])
 
-    // 删除已使用的验证码
     resetCodeStore.delete(email)
-
     console.log(`[Auth] 密码重置成功: ${email}`)
     res.json({ success: true, message: '密码重置成功，请使用新密码登录' })
   } catch (err) {

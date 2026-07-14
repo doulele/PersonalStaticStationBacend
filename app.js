@@ -1,8 +1,10 @@
+import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
 import config from './config/index.js'
 import routes from './routes/index.js'
 import { errorHandler, notFoundHandler } from './middlewares/errorHandler.js'
+import { initDatabase } from './services/db.js'
 
 const app = express()
 
@@ -41,6 +43,9 @@ app.use(errorHandler)
 import { createServer } from 'http'
 
 async function startServer() {
+  // 初始化 SQLite 数据库
+  await initDatabase()
+
   const server = createServer(app)
 
   process.on('SIGINT', () => {

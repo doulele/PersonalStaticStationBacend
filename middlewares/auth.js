@@ -1,14 +1,14 @@
 /**
  * JWT 认证中间件
  * 支持 Bearer Token（新系统）和 x-auth-token（旧系统兼容）
+ *
+ * 数据源：SQLite 数据库
  */
 import jwt from 'jsonwebtoken'
-import fs from 'fs'
-import path from 'path'
+import { dbGet, dbAll } from '../services/db.js'
 
 const JWT_SECRET = process.env.JWT_SECRET || 'static-tool-jwt-secret-2024'
 const JWT_EXPIRES_IN = '7d'
-const USERS_FILE = path.join(process.cwd(), 'data', 'users.json')
 
 /**
  * 从 JWT 或旧 token 中获取 userId
@@ -21,10 +21,11 @@ function getUserIdFromToken(token) {
   } catch {
     // JWT 验证失败，尝试旧的 SHA256 token
     try {
-      const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'))
-      for (const [userId, user] of Object.entries(users)) {
-        if (user.tokens && user.tokens.includes(token)) {
-          return userId
+      const rows = dbAll('SELECT userId, tokens FROM users')
+      for (const row of rows) {
+        const tokens = JSON.parse(row.tokens || '[]')
+        if (tokens.includes(token)) {
+          return row.userId
         }
       }
     } catch { /* ignore */ }
@@ -33,21 +34,15 @@ function getUserIdFromToken(token) {
 }
 
 /**
- * 读取用户信息
+ * 读取用户信息（不含敏感字段）
  */
 function getUserById(userId) {
   try {
-    const users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf-8'))
-    const user = users[userId]
-    if (!user) return null
-    // 不暴露密码哈希等敏感字段
-    return {
-      userId: user.userId,
-      email: user.email || null,
-      nickname: user.nickname || null,
-      createdAt: user.createdAt,
-      lastLogin: user.lastLogin
-    }
+    const user = dbGet(
+      'SELECT userId, email, nickname, createdAt, lastLogin FROM users WHERE userId = ?',
+      [userId]
+    )
+    return user || null
   } catch {
     return null
   }
@@ -121,4 +116,4 @@ export function authOptional(req, res, next) {
   next()
 }
 
-export { JWT_SECRET, USERS_FILE }
+export { JWT_SECRET }

@@ -63,6 +63,9 @@ export default {
   // 高德地图 Web 服务 API Key（后端使用：POI搜索、地理编码等）
   amapWebServiceKey: process.env.AMAP_WEB_SERVICE_KEY || '',
 
+  // 注册邀请码
+  inviteCode: process.env.INVITE_CODE || '',
+
   // yt-dlp 配置
   ytDlp: {
     // yt-dlp 可执行文件路径，留空则在 PATH 中查找
