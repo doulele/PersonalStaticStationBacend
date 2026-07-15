@@ -56,6 +56,75 @@ export async function initDatabase() {
 
 // ==================== 表定义 ====================
 
+/** 从旧版 family_meeting_state（id=1）迁移到新版（userId 主键） */
+function migrateFamilyMeetingState() {
+  try {
+    const result = _db.exec("PRAGMA table_info('family_meeting_state')")
+    if (result.length === 0) return // 表不存在
+
+    const columns = result[0].values.map(r => r[1])
+    if (columns.includes('userId')) return // 已迁移
+
+    console.log('[DB] 检测到旧版 family_meeting_state 表，开始迁移...')
+
+    // 读取旧数据
+    const oldData = _db.exec("SELECT state FROM family_meeting_state WHERE id = 1")
+    const oldState = (oldData.length > 0 && oldData[0].values.length > 0)
+      ? oldData[0].values[0][0] : null
+
+    // 删除旧表
+    _db.run('DROP TABLE family_meeting_state')
+
+    // 创建新表
+    _db.run(`
+      CREATE TABLE family_meeting_state (
+        userId TEXT PRIMARY KEY,
+        state TEXT
+      )
+    `)
+
+    // 迁移旧数据
+    if (oldState) {
+      try {
+        const parsed = JSON.parse(oldState)
+        const ownerId = parsed?.family?.adminId || 'legacy_user'
+        _db.run('INSERT OR REPLACE INTO family_meeting_state (userId, state) VALUES (?, ?)', [ownerId, oldState])
+        console.log(`[DB] 已迁移旧数据到用户: ${ownerId}`)
+      } catch {
+        console.log('[DB] 旧数据无法解析，跳过迁移')
+      }
+    }
+
+    console.log('[DB] family_meeting_state 迁移完成')
+  } catch (e) {
+    console.error('[DB] 迁移 family_meeting_state 失败:', e.message)
+  }
+}
+
+/** 为 users 表添加用户名注册相关列（兼容旧数据库迁移） */
+function migrateUsersTable() {
+  try {
+    const result = _db.exec("PRAGMA table_info('users')")
+    if (result.length === 0) return
+    const columns = result[0].values.map(r => r[1])
+
+    if (!columns.includes('username')) {
+      _db.run('ALTER TABLE users ADD COLUMN username TEXT UNIQUE')
+      console.log('[DB] 已添加 users.username 列')
+    }
+    if (!columns.includes('securityQuestion')) {
+      _db.run('ALTER TABLE users ADD COLUMN securityQuestion TEXT')
+      console.log('[DB] 已添加 users.securityQuestion 列')
+    }
+    if (!columns.includes('securityAnswerHash')) {
+      _db.run('ALTER TABLE users ADD COLUMN securityAnswerHash TEXT')
+      console.log('[DB] 已添加 users.securityAnswerHash 列')
+    }
+  } catch (e) {
+    console.error('[DB] 迁移 users 表失败:', e.message)
+  }
+}
+
 function createTables() {
   _db.run(`
     CREATE TABLE IF NOT EXISTS users (
@@ -66,9 +135,15 @@ function createTables() {
       pinHash   TEXT,
       createdAt TEXT,
       lastLogin TEXT,
-      tokens    TEXT DEFAULT '[]'
+      tokens    TEXT DEFAULT '[]',
+      username  TEXT UNIQUE,
+      securityQuestion TEXT,
+      securityAnswerHash TEXT
     )
   `)
+
+  // 自动迁移旧数据库（添加 username / securityQuestion / securityAnswerHash 列）
+  migrateUsersTable()
 
   _db.run(`
     CREATE TABLE IF NOT EXISTS user_plans (
@@ -101,10 +176,12 @@ function createTables() {
     )
   `)
 
-  // 家庭会议：全量状态存为 JSON blob（保持与前端 Vuex store 结构一致）
+  // 家庭会议：全量状态存为 JSON blob（按 userId 隔离）
+  // 先检查是否需要从旧表迁移（旧表用 id=1，新表用 userId 做主键）
+  migrateFamilyMeetingState()
   _db.run(`
     CREATE TABLE IF NOT EXISTS family_meeting_state (
-      id    INTEGER PRIMARY KEY CHECK (id = 1),
+      userId TEXT PRIMARY KEY,
       state TEXT
     )
   `)
@@ -212,6 +289,25 @@ export function dbTransaction(fn) {
     _db.run('ROLLBACK')
     throw err
   }
+}
+
+/**
+ * 更新用户信息
+ * @param {string} userId - 用户ID
+ * @param {Object} fields - 要更新的字段 { nickname?, passwordHash?, ... }
+ * @returns {Object} { changes }
+ */
+export function updateUser(userId, fields) {
+  const keys = Object.keys(fields)
+  if (keys.length === 0) return { changes: 0 }
+
+  const setClauses = keys.map(k => `${k} = ?`).join(', ')
+  const values = keys.map(k => fields[k])
+
+  return dbRun(
+    `UPDATE users SET ${setClauses} WHERE userId = ?`,
+    [...values, userId]
+  )
 }
 
 console.log('[DB] 模块已加载（需调用 initDatabase() 初始化）')

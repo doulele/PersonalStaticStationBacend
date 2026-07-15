@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs'
 import crypto from 'crypto'
 import nodemailer from 'nodemailer'
 import { authRequired, generateJwt } from '../middlewares/auth.js'
-import { dbGet, dbRun } from '../services/db.js'
+import { dbGet, dbRun, updateUser } from '../services/db.js'
 
 const router = Router()
 
@@ -78,61 +78,129 @@ function findUserByEmail(email) {
   return dbGet('SELECT * FROM users WHERE email = ?', [email])
 }
 
+/** 根据用户名查找用户 */
+function findUserByUsername(username) {
+  return dbGet('SELECT * FROM users WHERE username = ?', [username])
+}
+
 // ==================== 注册 ====================
 
 /**
  * POST /auth/register
- * Body: { email, password, nickname }
+ * 两种注册方式：
+ *   邮箱注册：{ email, password, nickname, inviteCode }
+ *   用户名注册：{ username, password, nickname, securityQuestion, securityAnswer }
  */
 router.post('/register', (req, res) => {
   try {
-    const { email, password, nickname, inviteCode } = req.body
+    const { email, username, password, nickname, inviteCode, securityQuestion, securityAnswer } = req.body
 
-    if (!email || !password || !nickname || !inviteCode) {
-      return res.status(400).json({ error: '请填写所有必填项（含邀请码）' })
-    }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).json({ error: '请提供有效的邮箱地址' })
-    }
-    if (password.length < 6) {
-      return res.status(400).json({ error: '密码长度不能少于6位' })
-    }
-    if (nickname.length < 2 || nickname.length > 20) {
-      return res.status(400).json({ error: '昵称长度应为2-20个字符' })
-    }
+    // 判断注册方式
+    const isUsernameMode = !!username && !email
 
-    // 验证邀请码
-    const validInviteCode = process.env.INVITE_CODE
-    if (!validInviteCode) {
-      console.error('[Auth] 服务端未配置 INVITE_CODE 环境变量')
-      return res.status(500).json({ error: '注册功能暂不可用' })
+    if (isUsernameMode) {
+      // ========== 用户名注册（需要邀请码） ==========
+      if (!username || !password || !nickname || !securityQuestion || !securityAnswer || !inviteCode) {
+        return res.status(400).json({ error: '请填写所有必填项（用户名、密码、昵称、密保问题、密保答案、邀请码）' })
+      }
+      if (username.length < 2 || username.length > 20) {
+        return res.status(400).json({ error: '用户名长度应为2-20个字符' })
+      }
+      if (!/^[a-zA-Z0-9_\u4e00-\u9fa5]+$/.test(username)) {
+        return res.status(400).json({ error: '用户名只能包含字母、数字、下划线和中文' })
+      }
+      if (password.length < 6) {
+        return res.status(400).json({ error: '密码长度不能少于6位' })
+      }
+      if (nickname.length < 2 || nickname.length > 20) {
+        return res.status(400).json({ error: '昵称长度应为2-20个字符' })
+      }
+      if (securityAnswer.length < 2 || securityAnswer.length > 50) {
+        return res.status(400).json({ error: '密保答案长度应为2-50个字符' })
+      }
+
+      // 验证邀请码
+      const validInviteCode = process.env.INVITE_CODE
+      if (!validInviteCode) {
+        console.error('[Auth] 服务端未配置 INVITE_CODE 环境变量')
+        return res.status(500).json({ error: '注册功能暂不可用' })
+      }
+      if (inviteCode !== validInviteCode) {
+        return res.status(403).json({ error: '邀请码错误，无法注册' })
+      }
+
+      // 检查用户名是否已被注册
+      if (findUserByUsername(username)) {
+        return res.status(409).json({ error: '该用户名已被使用' })
+      }
+
+      // 创建新用户
+      const userId = `u_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+      const salt = bcrypt.genSaltSync(10)
+      const passwordHash = bcrypt.hashSync(password, salt)
+      const answerHash = bcrypt.hashSync(securityAnswer.trim(), salt)
+      const now = new Date().toISOString()
+
+      dbRun(
+        'INSERT INTO users (userId, username, email, passwordHash, nickname, securityQuestion, securityAnswerHash, pinHash, createdAt, lastLogin, tokens) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+        [userId, username, null, passwordHash, nickname, securityQuestion, answerHash, null, now, now, '[]']
+      )
+
+      const token = generateJwt(userId, username)
+
+      res.status(201).json({
+        success: true,
+        data: { token, userId, username, email: null, nickname, createdAt: now }
+      })
+
+    } else {
+      // ========== 邮箱注册（原有流程） ==========
+      if (!email || !password || !nickname || !inviteCode) {
+        return res.status(400).json({ error: '请填写所有必填项（含邀请码）' })
+      }
+      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ error: '请提供有效的邮箱地址' })
+      }
+      if (password.length < 6) {
+        return res.status(400).json({ error: '密码长度不能少于6位' })
+      }
+      if (nickname.length < 2 || nickname.length > 20) {
+        return res.status(400).json({ error: '昵称长度应为2-20个字符' })
+      }
+
+      // 验证邀请码
+      const validInviteCode = process.env.INVITE_CODE
+      if (!validInviteCode) {
+        console.error('[Auth] 服务端未配置 INVITE_CODE 环境变量')
+        return res.status(500).json({ error: '注册功能暂不可用' })
+      }
+      if (inviteCode !== validInviteCode) {
+        return res.status(403).json({ error: '邀请码错误，无法注册' })
+      }
+
+      // 检查邮箱是否已被注册
+      if (findUserByEmail(email)) {
+        return res.status(409).json({ error: '该邮箱已被注册' })
+      }
+
+      // 创建新用户
+      const userId = `u_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
+      const salt = bcrypt.genSaltSync(10)
+      const passwordHash = bcrypt.hashSync(password, salt)
+      const now = new Date().toISOString()
+
+      dbRun(
+        'INSERT INTO users (userId, email, passwordHash, nickname, pinHash, createdAt, lastLogin, tokens) VALUES (?,?,?,?,?,?,?,?)',
+        [userId, email, passwordHash, nickname, null, now, now, '[]']
+      )
+
+      const token = generateJwt(userId, email)
+
+      res.status(201).json({
+        success: true,
+        data: { token, userId, email, nickname, createdAt: now }
+      })
     }
-    if (inviteCode !== validInviteCode) {
-      return res.status(403).json({ error: '邀请码错误，无法注册' })
-    }
-
-    // 检查邮箱是否已被注册
-    if (findUserByEmail(email)) {
-      return res.status(409).json({ error: '该邮箱已被注册' })
-    }
-
-    // 创建新用户
-    const userId = `u_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
-    const salt = bcrypt.genSaltSync(10)
-    const passwordHash = bcrypt.hashSync(password, salt)
-    const now = new Date().toISOString()
-
-    dbRun(
-      'INSERT INTO users (userId, email, passwordHash, nickname, pinHash, createdAt, lastLogin, tokens) VALUES (?,?,?,?,?,?,?,?)',
-      [userId, email, passwordHash, nickname, null, now, now, '[]']
-    )
-
-    const token = generateJwt(userId, email)
-
-    res.status(201).json({
-      success: true,
-      data: { token, userId, email, nickname, createdAt: now }
-    })
   } catch (err) {
     console.error('[Auth] 注册失败:', err.message)
     res.status(500).json({ error: '注册失败，请稍后重试' })
@@ -143,19 +211,30 @@ router.post('/register', (req, res) => {
 
 /**
  * POST /auth/login
- * Body: { email, password }
+ * Body: { email, password } 或 { username, password }
+ * 支持邮箱和用户名两种登录方式
  */
 router.post('/login', (req, res) => {
   try {
-    const { email, password } = req.body
+    const { email, username, password } = req.body
 
-    if (!email || !password) {
-      return res.status(400).json({ error: '请填写邮箱和密码' })
+    if ((!email && !username) || !password) {
+      return res.status(400).json({ error: '请填写账号和密码' })
     }
 
-    const user = findUserByEmail(email)
+    // 查找用户：优先按用户名，其次按邮箱
+    let user = null
+    let loginField = ''
+    if (username) {
+      user = findUserByUsername(username)
+      loginField = '用户名'
+    } else if (email) {
+      user = findUserByEmail(email)
+      loginField = '邮箱'
+    }
+
     if (!user) {
-      return res.status(401).json({ error: '邮箱或密码错误' })
+      return res.status(401).json({ error: `${loginField}或密码错误` })
     }
 
     if (!user.passwordHash) {
@@ -164,14 +243,14 @@ router.post('/login', (req, res) => {
 
     const isPasswordValid = bcrypt.compareSync(password, user.passwordHash)
     if (!isPasswordValid) {
-      return res.status(401).json({ error: '邮箱或密码错误' })
+      return res.status(401).json({ error: `${loginField}或密码错误` })
     }
 
     // 更新最后登录时间
     const now = new Date().toISOString()
     dbRun('UPDATE users SET lastLogin = ? WHERE userId = ?', [now, user.userId])
 
-    const token = generateJwt(user.userId, user.email)
+    const token = generateJwt(user.userId, user.email || user.username)
 
     res.json({
       success: true,
@@ -179,6 +258,7 @@ router.post('/login', (req, res) => {
         token,
         userId: user.userId,
         email: user.email,
+        username: user.username,
         nickname: user.nickname,
         createdAt: user.createdAt,
         lastLogin: now
@@ -198,7 +278,7 @@ router.post('/login', (req, res) => {
 router.get('/profile', authRequired, (req, res) => {
   try {
     const user = dbGet(
-      'SELECT userId, email, nickname, createdAt, lastLogin FROM users WHERE userId = ?',
+      'SELECT userId, email, username, nickname, createdAt, lastLogin FROM users WHERE userId = ?',
       [req.userId]
     )
     if (!user) {
@@ -209,6 +289,41 @@ router.get('/profile', authRequired, (req, res) => {
   } catch (err) {
     console.error('[Auth] 获取信息失败:', err.message)
     res.status(500).json({ error: '获取用户信息失败' })
+  }
+})
+
+// ==================== 更新个人资料 ====================
+
+/**
+ * PUT /auth/update-profile
+ * Body: { nickname } — 修改昵称
+ */
+router.put('/update-profile', authRequired, (req, res) => {
+  try {
+    const { nickname } = req.body
+
+    if (!nickname) {
+      return res.status(400).json({ error: '昵称不能为空' })
+    }
+    if (nickname.length < 2 || nickname.length > 20) {
+      return res.status(400).json({ error: '昵称长度应为2-20个字符' })
+    }
+
+    const user = dbGet('SELECT * FROM users WHERE userId = ?', [req.userId])
+    if (!user) {
+      return res.status(404).json({ error: '用户不存在' })
+    }
+
+    updateUser(req.userId, { nickname: nickname.trim() })
+
+    res.json({
+      success: true,
+      data: { nickname: nickname.trim() },
+      message: '个人资料更新成功'
+    })
+  } catch (err) {
+    console.error('[Auth] 更新资料失败:', err.message)
+    res.status(500).json({ error: '更新资料失败，请稍后重试' })
   }
 })
 
@@ -324,6 +439,81 @@ router.post('/reset-password', async (req, res) => {
     res.json({ success: true, message: '密码重置成功，请使用新密码登录' })
   } catch (err) {
     console.error('[Auth] 重置密码失败:', err.message)
+    res.status(500).json({ error: '重置密码失败，请稍后重试' })
+  }
+})
+
+// ==================== 用户名找回密码（密保问题） ====================
+
+/**
+ * POST /auth/forgot-password-username
+ * Body: { username } — 返回密保问题
+ */
+router.post('/forgot-password-username', (req, res) => {
+  try {
+    const { username } = req.body
+    if (!username) {
+      return res.status(400).json({ error: '请输入用户名' })
+    }
+
+    const user = findUserByUsername(username)
+    if (!user) {
+      return res.status(404).json({ error: '该用户名不存在' })
+    }
+    if (!user.securityQuestion) {
+      return res.status(400).json({ error: '该账号未设置密保问题，无法找回密码' })
+    }
+
+    res.json({
+      success: true,
+      data: {
+        securityQuestion: user.securityQuestion
+      }
+    })
+  } catch (err) {
+    console.error('[Auth] 获取密保问题失败:', err.message)
+    res.status(500).json({ error: '操作失败，请稍后重试' })
+  }
+})
+
+/**
+ * POST /auth/reset-password-username
+ * Body: { username, securityAnswer, newPassword } — 验证密保答案并重置密码
+ */
+router.post('/reset-password-username', (req, res) => {
+  try {
+    const { username, securityAnswer, newPassword } = req.body
+
+    if (!username || !securityAnswer || !newPassword) {
+      return res.status(400).json({ error: '请填写所有必填项' })
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: '新密码长度不能少于6位' })
+    }
+
+    const user = findUserByUsername(username)
+    if (!user) {
+      return res.status(404).json({ error: '用户不存在' })
+    }
+    if (!user.securityAnswerHash) {
+      return res.status(400).json({ error: '该账号未设置密保问题' })
+    }
+
+    // 验证密保答案
+    const isAnswerValid = bcrypt.compareSync(securityAnswer.trim(), user.securityAnswerHash)
+    if (!isAnswerValid) {
+      return res.status(400).json({ error: '密保答案错误' })
+    }
+
+    // 重置密码
+    const salt = bcrypt.genSaltSync(10)
+    const newHash = bcrypt.hashSync(newPassword, salt)
+    dbRun('UPDATE users SET passwordHash = ? WHERE userId = ?', [newHash, user.userId])
+
+    console.log(`[Auth] 密码重置成功（用户名）: ${username}`)
+    res.json({ success: true, message: '密码重置成功，请使用新密码登录' })
+  } catch (err) {
+    console.error('[Auth] 重置密码失败（用户名）:', err.message)
     res.status(500).json({ error: '重置密码失败，请稍后重试' })
   }
 })
