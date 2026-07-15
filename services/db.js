@@ -63,9 +63,9 @@ function migrateFamilyMeetingState() {
     if (result.length === 0) return // 表不存在
 
     const columns = result[0].values.map(r => r[1])
-    if (columns.includes('userId')) return // 已迁移
+    if (columns.includes('userId') || columns.includes('familyId')) return // 已迁移
 
-    console.log('[DB] 检测到旧版 family_meeting_state 表，开始迁移...')
+    console.log('[DB] 检测到旧版 family_meeting_state 表（id=1），开始迁移...')
 
     // 读取旧数据
     const oldData = _db.exec("SELECT state FROM family_meeting_state WHERE id = 1")
@@ -75,10 +75,10 @@ function migrateFamilyMeetingState() {
     // 删除旧表
     _db.run('DROP TABLE family_meeting_state')
 
-    // 创建新表
+    // 创建新版表（直接使用 familyId 主键，跳过 userId 中间版本）
     _db.run(`
       CREATE TABLE family_meeting_state (
-        userId TEXT PRIMARY KEY,
+        familyId TEXT PRIMARY KEY,
         state TEXT
       )
     `)
@@ -87,9 +87,11 @@ function migrateFamilyMeetingState() {
     if (oldState) {
       try {
         const parsed = JSON.parse(oldState)
-        const ownerId = parsed?.family?.adminId || 'legacy_user'
-        _db.run('INSERT OR REPLACE INTO family_meeting_state (userId, state) VALUES (?, ?)', [ownerId, oldState])
-        console.log(`[DB] 已迁移旧数据到用户: ${ownerId}`)
+        const familyId = parsed?.family?.id
+        if (familyId) {
+          _db.run('INSERT OR REPLACE INTO family_meeting_state (familyId, state) VALUES (?, ?)', [familyId, oldState])
+          console.log(`[DB] 已迁移旧数据到 familyId: ${familyId}`)
+        }
       } catch {
         console.log('[DB] 旧数据无法解析，跳过迁移')
       }
@@ -98,6 +100,85 @@ function migrateFamilyMeetingState() {
     console.log('[DB] family_meeting_state 迁移完成')
   } catch (e) {
     console.error('[DB] 迁移 family_meeting_state 失败:', e.message)
+  }
+}
+
+/** 从 userId 版本迁移到 familyId 版本（多用户共享） */
+function migrateFamilyMeetingStateV2() {
+  try {
+    // 确保 memberships 表存在
+    _db.run(`
+      CREATE TABLE IF NOT EXISTS family_meeting_memberships (
+        id TEXT PRIMARY KEY,
+        familyId TEXT NOT NULL,
+        userId TEXT NOT NULL,
+        memberName TEXT DEFAULT '',
+        role TEXT DEFAULT 'member',
+        joinedAt TEXT,
+        UNIQUE(familyId, userId)
+      )
+    `)
+
+    const result = _db.exec("PRAGMA table_info('family_meeting_state')")
+    if (result.length === 0) return
+
+    const columns = result[0].values.map(r => r[1])
+    // 如果已经是 familyId 主键，跳过
+    if (columns.includes('familyId')) return
+    // 如果没有 userId 列也没有 familyId 列，也跳过（由 migrateFamilyMeetingState 处理）
+    if (!columns.includes('userId')) return
+
+    console.log('[DB] 检测到 userId 版本的 family_meeting_state，开始迁移到 familyId 版本...')
+
+    // 读取所有现有数据
+    const oldRows = _db.exec("SELECT userId, state FROM family_meeting_state")
+    const rows = (oldRows.length > 0 && oldRows[0].values) ? oldRows[0].values : []
+
+    // 删除旧表，创建新表
+    _db.run('DROP TABLE family_meeting_state')
+    _db.run(`
+      CREATE TABLE family_meeting_state (
+        familyId TEXT PRIMARY KEY,
+        state TEXT
+      )
+    `)
+
+    // 迁移数据
+    let migratedCount = 0
+    for (const [userId, stateJson] of rows) {
+      try {
+        const state = JSON.parse(stateJson)
+        const familyId = state?.family?.id
+        if (!familyId) {
+          console.log(`[DB] 跳过无家庭数据的用户: ${userId}`)
+          continue
+        }
+
+        // 查找管理员成员名称
+        const adminMember = state.members?.find(m => m.id === state.family?.adminId)
+        const adminName = adminMember?.name || ''
+
+        // 保存 state 到新表（familyId 主键）
+        _db.run('INSERT OR REPLACE INTO family_meeting_state (familyId, state) VALUES (?, ?)',
+          [familyId, stateJson])
+
+        // 为家庭创建者创建 membership 记录
+        const membershipId = 'ms_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
+        _db.run(
+          'INSERT OR IGNORE INTO family_meeting_memberships (id, familyId, userId, memberName, role, joinedAt) VALUES (?, ?, ?, ?, ?, ?)',
+          [membershipId, familyId, userId, adminName, 'admin', new Date().toISOString()]
+        )
+
+        migratedCount++
+        console.log(`[DB] 已迁移家庭「${state.family?.name}」 familyId=${familyId}，管理员 userId=${userId}`)
+      } catch (e) {
+        console.error('[DB] 迁移 family_meeting_state 单行失败:', e.message)
+      }
+    }
+
+    console.log(`[DB] family_meeting_state V2 迁移完成，共迁移 ${migratedCount} 个家庭`)
+  } catch (e) {
+    console.error('[DB] 迁移 family_meeting_state V2 失败:', e.message)
   }
 }
 
@@ -176,13 +257,27 @@ function createTables() {
     )
   `)
 
-  // 家庭会议：全量状态存为 JSON blob（按 userId 隔离）
-  // 先检查是否需要从旧表迁移（旧表用 id=1，新表用 userId 做主键）
-  migrateFamilyMeetingState()
+  // 家庭会议：全量状态存为 JSON blob（按 familyId 共享，多用户可访问同一家庭数据）
+  // 迁移顺序：先迁移最旧格式 → 再迁移 userId 格式 → 最后创建最新表结构
+  migrateFamilyMeetingState()     // V1: id=1 → userId/familyId PK
+  migrateFamilyMeetingStateV2()   // V2: userId PK → familyId PK（多用户共享）
   _db.run(`
     CREATE TABLE IF NOT EXISTS family_meeting_state (
-      userId TEXT PRIMARY KEY,
+      familyId TEXT PRIMARY KEY,
       state TEXT
+    )
+  `)
+
+  // 家庭成员关系表（关联真实登录用户与家庭空间）
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS family_meeting_memberships (
+      id TEXT PRIMARY KEY,
+      familyId TEXT NOT NULL,
+      userId TEXT NOT NULL,
+      memberName TEXT DEFAULT '',
+      role TEXT DEFAULT 'member',
+      joinedAt TEXT,
+      UNIQUE(familyId, userId)
     )
   `)
 
@@ -204,6 +299,123 @@ function createTables() {
       size      INTEGER DEFAULT 0,
       duration  REAL DEFAULT 0,
       createdAt TEXT
+    )
+  `)
+
+  // ========== 愿望清单 & 树洞 相关表 ==========
+
+  // 家庭空间（独立于 familyMeeting）
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS wish_families (
+      id         TEXT PRIMARY KEY,
+      name       TEXT NOT NULL,
+      adminId    TEXT NOT NULL,
+      inviteCode TEXT UNIQUE,
+      createdAt  TEXT,
+      FOREIGN KEY (adminId) REFERENCES users(userId)
+    )
+  `)
+
+  // 家庭成员
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS wish_family_members (
+      id        TEXT PRIMARY KEY,
+      familyId  TEXT NOT NULL,
+      userId    TEXT NOT NULL,
+      name      TEXT NOT NULL,
+      role      TEXT DEFAULT 'member',
+      avatar    TEXT DEFAULT '',
+      joinedAt  TEXT,
+      FOREIGN KEY (familyId) REFERENCES wish_families(id),
+      FOREIGN KEY (userId) REFERENCES users(userId),
+      UNIQUE(familyId, userId)
+    )
+  `)
+
+  // 愿望
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS wishes (
+      id          TEXT PRIMARY KEY,
+      familyId    TEXT NOT NULL,
+      userId      TEXT NOT NULL,
+      title       TEXT NOT NULL,
+      description TEXT DEFAULT '',
+      category    TEXT DEFAULT '生活',
+      priority    TEXT DEFAULT '中',
+      status      TEXT DEFAULT '进行中',
+      progress    INTEGER DEFAULT 0,
+      targetDate  TEXT,
+      createdAt   TEXT,
+      updatedAt   TEXT,
+      archivedAt  TEXT,
+      isShared    INTEGER DEFAULT 1,
+      mediaLinks  TEXT DEFAULT '[]',
+      subTasks    TEXT DEFAULT '[]',
+      FOREIGN KEY (familyId) REFERENCES wish_families(id),
+      FOREIGN KEY (userId) REFERENCES users(userId)
+    )
+  `)
+
+  // 愿望打卡记录
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS wish_checkins (
+      id        TEXT PRIMARY KEY,
+      wishId    TEXT NOT NULL,
+      userId    TEXT NOT NULL,
+      note      TEXT DEFAULT '',
+      progress  INTEGER DEFAULT 0,
+      createdAt TEXT,
+      FOREIGN KEY (wishId) REFERENCES wishes(id),
+      FOREIGN KEY (userId) REFERENCES users(userId)
+    )
+  `)
+
+  // 树洞/情绪（Mood）
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS moods (
+      id           TEXT PRIMARY KEY,
+      familyId     TEXT NOT NULL,
+      userId       TEXT NOT NULL,
+      content      TEXT NOT NULL,
+      isAnonymous  INTEGER DEFAULT 1,
+      animalMask   TEXT DEFAULT '',
+      moodWeather  TEXT DEFAULT '',
+      wishId       TEXT,
+      sosTriggered INTEGER DEFAULT 0,
+      createdAt    TEXT,
+      FOREIGN KEY (familyId) REFERENCES wish_families(id),
+      FOREIGN KEY (userId) REFERENCES users(userId),
+      FOREIGN KEY (wishId) REFERENCES wishes(id)
+    )
+  `)
+
+  // 拍一拍/互动
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS pats (
+      id         TEXT PRIMARY KEY,
+      fromUserId TEXT NOT NULL,
+      toUserId   TEXT NOT NULL,
+      targetType TEXT DEFAULT 'wish',
+      targetId   TEXT,
+      message    TEXT DEFAULT '',
+      createdAt  TEXT,
+      FOREIGN KEY (fromUserId) REFERENCES users(userId),
+      FOREIGN KEY (toUserId) REFERENCES users(userId)
+    )
+  `)
+
+  // 通知
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS notifications (
+      id        TEXT PRIMARY KEY,
+      userId    TEXT NOT NULL,
+      type      TEXT NOT NULL,
+      title     TEXT NOT NULL,
+      content   TEXT DEFAULT '',
+      relatedId TEXT,
+      isRead    INTEGER DEFAULT 0,
+      createdAt TEXT,
+      FOREIGN KEY (userId) REFERENCES users(userId)
     )
   `)
 }
@@ -308,6 +520,27 @@ export function updateUser(userId, fields) {
     `UPDATE users SET ${setClauses} WHERE userId = ?`,
     [...values, userId]
   )
+}
+
+/**
+ * 查询用户所属的家庭 ID
+ * @param {string} userId - 登录用户 ID
+ * @returns {string|null} familyId 或 null
+ */
+export function getFamilyId(userId) {
+  const row = dbGet('SELECT familyId FROM family_meeting_memberships WHERE userId = ?', [userId])
+  return row ? row.familyId : null
+}
+
+/**
+ * 检查用户是否是某个家庭的成员
+ */
+export function isFamilyMember(familyId, userId) {
+  const row = dbGet(
+    'SELECT id FROM family_meeting_memberships WHERE familyId = ? AND userId = ?',
+    [familyId, userId]
+  )
+  return !!row
 }
 
 console.log('[DB] 模块已加载（需调用 initDatabase() 初始化）')

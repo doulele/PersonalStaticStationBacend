@@ -14,6 +14,7 @@ import oilPriceRoutes from './oilPrice.js'
 import familyRoutes from './family.js'
 import familyMeetingRoutes from './familyMeeting.js'
 import videoParseRoutes from './videoParse.js'
+import wishTreeHoleRoutes from './wishTreeHole.js'
 
 const router = Router()
 
@@ -42,6 +43,7 @@ router.use('/oil-price', oilPriceRoutes)
 router.use('/family', familyRoutes)
 router.use('/family-meeting', familyMeetingRoutes)
 router.use('/video-parse', videoParseRoutes)
+router.use('/wish-tree-hole', wishTreeHoleRoutes)
 
 // 健康检查
 router.get('/health', (req, res) => {
