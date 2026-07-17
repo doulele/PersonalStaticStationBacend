@@ -212,7 +212,7 @@ function createTables() {
       userId    TEXT PRIMARY KEY,
       email     TEXT UNIQUE,
       passwordHash TEXT,
-      nickname  TEXT,
+      nickname  TEXT UNIQUE,
       pinHash   TEXT,
       createdAt TEXT,
       lastLogin TEXT,
@@ -299,6 +299,22 @@ function createTables() {
       size      INTEGER DEFAULT 0,
       duration  REAL DEFAULT 0,
       createdAt TEXT
+    )
+  `)
+
+  // 声纹库（家庭成员声纹特征向量）
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS family_voiceprints (
+      id TEXT PRIMARY KEY,
+      familyId TEXT NOT NULL,
+      memberId TEXT NOT NULL,
+      memberName TEXT DEFAULT '',
+      embedding TEXT NOT NULL,
+      embeddingDim INTEGER DEFAULT 192,
+      engine TEXT DEFAULT 'speechbrain',
+      audioDuration REAL DEFAULT 0,
+      enrolledAt TEXT,
+      UNIQUE(familyId, memberId)
     )
   `)
 

@@ -12,6 +12,14 @@ import multer from 'multer'
 import { transcribe, detectEngines, cleanupTempFiles } from '../services/whisper.js'
 import { dbGet, dbRun, dbAll, getFamilyId } from '../services/db.js'
 import { authRequired } from '../middlewares/auth.js'
+import {
+  enrollVoiceprint,
+  identifySpeakers,
+  getVoiceprintStatus,
+  listVoiceprints,
+  deleteVoiceprint,
+  deleteFamilyVoiceprints
+} from '../services/voiceprint.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = dirname(__filename)
@@ -56,12 +64,23 @@ const DEFAULT_STATE = () => ({
 
 /**
  * 加载状态：根据登录用户的 userId 查找其家庭ID，再加载共享的家庭状态
- * 如果用户不属于任何家庭，返回默认空状态
+ * @param {string} userId
+ * @param {string|null} targetFamilyId - 可选，指定要加载的家庭ID（用于多家庭切换）
  */
-function loadState(userId) {
+function loadState(userId, targetFamilyId = null) {
   try {
-    const familyId = getFamilyId(userId)
+    // 优先使用指定 familyId，否则自动查找用户的家庭
+    const familyId = targetFamilyId || getFamilyId(userId)
     if (!familyId) return DEFAULT_STATE()
+
+    // 如果指定了 familyId，验证用户是否是该家庭成员
+    if (targetFamilyId) {
+      const isMember = dbGet(
+        'SELECT 1 FROM family_meeting_memberships WHERE familyId = ? AND userId = ?',
+        [targetFamilyId, userId]
+      )
+      if (!isMember) return DEFAULT_STATE()
+    }
 
     const row = dbGet('SELECT state FROM family_meeting_state WHERE familyId = ?', [familyId])
     if (!row || !row.state) return DEFAULT_STATE()
@@ -77,8 +96,8 @@ function loadState(userId) {
     const myMembership = memberships.find(m => m.userId === userId)
     if (myMembership && !merged.members.find(m => m.id === userId)) {
       const adminMembers = merged.members.filter(m => m.role === 'admin')
-      if (adminMembers.length === 1) {
-        // 唯一的管理员就是旧数据里被随机 ID 化的当前用户，直接替换 ID
+      // 只有当当前用户是管理员，且唯一管理员的 ID 是随机生成的旧格式时，才替换 ID
+      if (adminMembers.length === 1 && myMembership.role === 'admin') {
         adminMembers[0].id = userId
         if (!adminMembers[0].name && myMembership.memberName) {
           adminMembers[0].name = myMembership.memberName
@@ -88,7 +107,7 @@ function loadState(userId) {
         // 无法确定对应哪个旧成员，新增一条当前用户记录
         merged.members.push({
           id: userId,
-          name: myMembership.memberName || '',
+          name: myMembership.memberName || getUserNickname(userId) || '',
           role: myMembership.role || 'member'
         })
       }
@@ -101,11 +120,13 @@ function loadState(userId) {
       if (!exists) {
         merged.members.push({
           id: ms.userId,
-          name: ms.memberName || '',
+          name: ms.memberName || getUserNickname(ms.userId) || '',
           role: ms.role || 'member'
         })
       } else if (ms.memberName && !exists.name) {
         exists.name = ms.memberName
+      } else if (!exists.name) {
+        exists.name = getUserNickname(ms.userId) || ''
       }
     }
 
@@ -113,6 +134,20 @@ function loadState(userId) {
   } catch (e) {
     console.error(`[family-meeting] 加载状态失败 (userId=${userId}):`, e.message)
     return DEFAULT_STATE()
+  }
+}
+
+/**
+ * 从 users 表查询用户昵称
+ * @param {string} userId
+ * @returns {string|null}
+ */
+function getUserNickname(userId) {
+  try {
+    const row = dbGet('SELECT nickname FROM users WHERE userId = ?', [userId])
+    return row?.nickname || ''
+  } catch {
+    return ''
   }
 }
 
@@ -138,6 +173,23 @@ function saveState(userId, state) {
       'INSERT OR IGNORE INTO family_meeting_memberships (id, familyId, userId, memberName, role, joinedAt) VALUES (?, ?, ?, ?, ?, ?)',
       [uid('ms'), familyId, userId, memberName, role, new Date().toISOString()]
     )
+
+    // 🔧 为所有成员创建 membership 记录（解决被添加成员登录后看不到家庭空间的问题）
+    // 只对 users 表中存在的真实用户创建记录，跳过随机 uid 的"纯名称"成员
+    if (state?.members && Array.isArray(state.members)) {
+      const now = new Date().toISOString()
+      for (const member of state.members) {
+        if (!member.id || member.id === userId) continue
+        // 检查该成员是否是注册用户（在 users 表中有记录）
+        const userExists = dbGet('SELECT 1 FROM users WHERE userId = ?', [member.id])
+        if (userExists) {
+          dbRun(
+            'INSERT OR IGNORE INTO family_meeting_memberships (id, familyId, userId, memberName, role, joinedAt) VALUES (?, ?, ?, ?, ?, ?)',
+            [uid('ms'), familyId, member.id, member.name || '', member.role || 'member', now]
+          )
+        }
+      }
+    }
 
     dbRun(
       'INSERT OR REPLACE INTO family_meeting_state (familyId, state) VALUES (?, ?)',
@@ -176,9 +228,14 @@ const router = Router()
 
 // ==================== 全量状态 ====================
 
+/**
+ * GET /state?familyId=xxx
+ * 支持指定 familyId 加载指定家庭的状态，用于多家庭切换
+ */
 router.get('/state', authRequired, (req, res) => {
   try {
-    const state = loadState(req.userId)
+    const { familyId } = req.query
+    const state = loadState(req.userId, familyId || null)
     res.json({ success: true, data: state })
   } catch (err) {
     console.error(`[family-meeting] GET /state 失败 (userId=${req.userId}):`, err)
@@ -226,17 +283,34 @@ router.post('/family', authRequired, (req, res) => {
     if (!name || !adminName) {
       return res.status(400).json({ success: false, error: '缺少 name 或 adminName' })
     }
+    // 支持多家庭：不再阻止已属于其他家庭的用户创建新家庭
     const state = loadState(req.userId)
-    if (state.family) {
-      return res.status(409).json({ success: false, error: '家庭空间已存在' })
+    // 如果当前活跃家庭空间已存在且正好同名 → 避免误操作
+    if (state.family && state.family.name === name.trim()) {
+      return res.status(409).json({ success: false, error: '同名家庭空间已存在' })
     }
     // 使用真实登录用户 ID 作为成员 ID，确保前端能匹配当前用户
-    state.family = { id: uid('f'), name: name.trim(), adminId: req.userId }
-    state.members = [{ id: req.userId, name: adminName.trim(), role: 'admin' }]
-    state.currentUserId = req.userId
-    saveState(req.userId, state)
-    console.log(`[family-meeting] 创建家庭: ${name}, 管理员: ${adminName}, userId: ${req.userId}`)
-    res.json({ success: true, data: state.family })
+    const newFamily = { id: uid('f'), name: name.trim(), adminId: req.userId }
+    const members = [{ id: req.userId, name: adminName.trim(), role: 'admin' }]
+
+    // 为新家庭独立保存一份空状态
+    const newState = {
+      ...DEFAULT_STATE(),
+      family: newFamily,
+      members,
+      currentUserId: req.userId
+    }
+    // 先创建 membership 再保存 state（saveState 需要 familyId 匹配）
+    dbRun(
+      'INSERT OR IGNORE INTO family_meeting_memberships (id, familyId, userId, memberName, role, joinedAt) VALUES (?, ?, ?, ?, ?, ?)',
+      [uid('ms'), newFamily.id, req.userId, adminName.trim(), 'admin', new Date().toISOString()]
+    )
+    dbRun(
+      'INSERT OR REPLACE INTO family_meeting_state (familyId, state) VALUES (?, ?)',
+      [newFamily.id, JSON.stringify(newState)]
+    )
+    console.log(`[family-meeting] 创建新家庭: ${name}, 管理员: ${adminName}, userId: ${req.userId}`)
+    res.json({ success: true, data: { family: newFamily, members } })
   } catch (err) {
     console.error(`[family-meeting] POST /family 失败 (userId=${req.userId}):`, err)
     res.status(500).json({ success: false, error: '创建失败' })
@@ -287,6 +361,7 @@ router.post('/family/leave', authRequired, (req, res) => {
     )
     if (!remaining || remaining.cnt === 0) {
       dbRun('DELETE FROM family_meeting_state WHERE familyId = ?', [familyId])
+      deleteFamilyVoiceprints(familyId)
       console.log(`[family-meeting] 家庭「${familyName}」(familyId=${familyId}) 无剩余成员，已清理全部数据`)
     }
 
@@ -294,6 +369,157 @@ router.post('/family/leave', authRequired, (req, res) => {
     res.json({ success: true, message: `已退出家庭空间「${familyName}」` })
   } catch (err) {
     console.error(`[family-meeting] POST /family/leave 失败 (userId=${req.userId}):`, err)
+    res.status(500).json({ success: false, error: '退出失败' })
+  }
+})
+
+// ==================== 多家庭支持 ====================
+
+/** 📋 获取用户参与的所有家庭列表 */
+router.get('/families', authRequired, (req, res) => {
+  try {
+    const rows = dbAll(
+      'SELECT m.familyId, m.memberName, m.role, m.joinedAt, s.state ' +
+      'FROM family_meeting_memberships m ' +
+      'LEFT JOIN family_meeting_state s ON m.familyId = s.familyId ' +
+      'WHERE m.userId = ? ' +
+      'ORDER BY m.joinedAt DESC',
+      [req.userId]
+    )
+    const families = rows.map(row => {
+      let familyName = '未知家庭'
+      let memberCount = 0
+      let meetingCount = 0
+      try {
+        if (row.state) {
+          const state = JSON.parse(row.state)
+          familyName = state.family?.name || '未知家庭'
+          memberCount = state.members?.length || 0
+          meetingCount = state.meetings?.length || 0
+        }
+      } catch { /* ignore */ }
+      return {
+        familyId: row.familyId,
+        familyName,
+        role: row.role,
+        memberName: row.memberName,
+        memberCount,
+        meetingCount,
+        joinedAt: row.joinedAt
+      }
+    })
+    res.json({ success: true, data: families })
+  } catch (err) {
+    console.error(`[family-meeting] GET /families 失败 (userId=${req.userId}):`, err)
+    res.status(500).json({ success: false, error: '读取家庭列表失败' })
+  }
+})
+
+/** 💣 解散家庭空间（仅管理员）— 删除家庭所有数据及所有成员关系 */
+router.delete('/family', authRequired, (req, res) => {
+  try {
+    const { familyId } = req.query
+    if (!familyId) {
+      return res.status(400).json({ success: false, error: '缺少 familyId 参数' })
+    }
+
+    // 验证是否为管理员
+    const membership = dbGet(
+      'SELECT role FROM family_meeting_memberships WHERE familyId = ? AND userId = ?',
+      [familyId, req.userId]
+    )
+    if (!membership) {
+      return res.status(403).json({ success: false, error: '你不是该家庭空间的成员' })
+    }
+    if (membership.role !== 'admin') {
+      return res.status(403).json({ success: false, error: '仅管理员可以解散家庭空间' })
+    }
+
+    // 获取家庭名称用于日志
+    let familyName = '未知'
+    const row = dbGet('SELECT state FROM family_meeting_state WHERE familyId = ?', [familyId])
+    if (row?.state) {
+      try { familyName = JSON.parse(row.state)?.family?.name || '未知' } catch { }
+    }
+
+    // 删除所有成员关系
+    dbRun('DELETE FROM family_meeting_memberships WHERE familyId = ?', [familyId])
+    // 删除家庭状态数据
+    dbRun('DELETE FROM family_meeting_state WHERE familyId = ?', [familyId])
+    // 清理声纹数据
+    deleteFamilyVoiceprints(familyId)
+
+    console.log(`[family-meeting] 家庭「${familyName}」(familyId=${familyId}) 已被管理员 ${req.userId} 解散`)
+    res.json({
+      success: true,
+      message: `家庭空间「${familyName}」已解散，所有数据已清除`,
+      dissolvedFamilyId: familyId
+    })
+  } catch (err) {
+    console.error(`[family-meeting] DELETE /family 失败 (userId=${req.userId}):`, err)
+    res.status(500).json({ success: false, error: '解散失败' })
+  }
+})
+
+/** 🚪 退出指定家庭空间（支持多家庭场景） */
+router.delete('/family/:familyId/leave', authRequired, (req, res) => {
+  try {
+    const { familyId } = req.params
+    if (!familyId) {
+      return res.status(400).json({ success: false, error: '缺少 familyId' })
+    }
+
+    // 验证是否是该家庭的管理员
+    const membership = dbGet(
+      'SELECT role, memberName FROM family_meeting_memberships WHERE familyId = ? AND userId = ?',
+      [familyId, req.userId]
+    )
+    if (!membership) {
+      return res.status(404).json({ success: false, error: '你不是该家庭的成员' })
+    }
+    if (membership.role === 'admin') {
+      return res.status(403).json({
+        success: false,
+        error: '管理员无法退出家庭，请先将管理员身份转让给其他成员，或直接解散家庭空间'
+      })
+    }
+
+    // 获取家庭名称
+    let familyName = '未知'
+    const row = dbGet('SELECT state FROM family_meeting_state WHERE familyId = ?', [familyId])
+    if (row?.state) {
+      try { familyName = JSON.parse(row.state)?.family?.name || '未知' } catch { }
+    }
+
+    // 删除该用户在这个家庭的 membership
+    dbRun('DELETE FROM family_meeting_memberships WHERE userId = ? AND familyId = ?', [req.userId, familyId])
+
+    // 从共享状态中移除该用户
+    if (row?.state) {
+      try {
+        const state = JSON.parse(row.state)
+        state.members = state.members.filter(m => m.id !== req.userId)
+        state.meetings.forEach(m => {
+          m.participants = m.participants.filter(p => p !== req.userId)
+        })
+        dbRun('INSERT OR REPLACE INTO family_meeting_state (familyId, state) VALUES (?, ?)',
+          [familyId, JSON.stringify(state)])
+      } catch { }
+    }
+
+    // 检查是否还有剩余成员
+    const remaining = dbGet(
+      'SELECT COUNT(*) as cnt FROM family_meeting_memberships WHERE familyId = ?',
+      [familyId]
+    )
+    if (!remaining || remaining.cnt === 0) {
+      dbRun('DELETE FROM family_meeting_state WHERE familyId = ?', [familyId])
+    }
+
+    console.log(`[family-meeting] 用户 ${req.userId} 已退出家庭「${familyName}」(familyId=${familyId})`)
+    res.json({ success: true, message: `已退出家庭空间「${familyName}」`, leftFamilyId: familyId })
+  } catch (err) {
+    console.error(`[family-meeting] DELETE /family/:familyId/leave 失败 (userId=${req.userId}):`, err)
     res.status(500).json({ success: false, error: '退出失败' })
   }
 })
@@ -348,6 +574,52 @@ router.put('/members/:id', authRequired, (req, res) => {
   } catch (err) {
     console.error(`[family-meeting] PUT /members 失败 (userId=${req.userId}):`, err)
     res.status(500).json({ success: false, error: '更新失败' })
+  }
+})
+
+/** 🚫 踢出成员（仅管理员）— 同时删除该成员的 membership 和 state 中的成员记录 */
+router.delete('/members/:id/kick', authRequired, (req, res) => {
+  try {
+    const { id } = req.params
+    const familyId = getFamilyId(req.userId)
+    if (!familyId) return res.status(404).json({ success: false, error: '家庭空间不存在' })
+
+    // 验证操作者是否是管理员
+    const operatorMembership = dbGet(
+      'SELECT role FROM family_meeting_memberships WHERE familyId = ? AND userId = ?',
+      [familyId, req.userId]
+    )
+    if (!operatorMembership || operatorMembership.role !== 'admin') {
+      return res.status(403).json({ success: false, error: '仅管理员可以踢出成员' })
+    }
+
+    // 不能踢出自己
+    if (id === req.userId) {
+      return res.status(400).json({ success: false, error: '不能踢出自己，请使用退出功能' })
+    }
+
+    const state = loadState(req.userId)
+    const targetMember = state.members.find(m => m.id === id)
+    if (!targetMember) {
+      return res.status(404).json({ success: false, error: '成员不存在' })
+    }
+
+    // 从 state.members 中移除
+    state.members = state.members.filter(m => m.id !== id)
+    // 从所有会议的参与者中移除
+    state.meetings.forEach(m => {
+      m.participants = m.participants.filter(p => p !== id)
+    })
+    saveState(req.userId, state)
+
+    // 删除该成员的 membership
+    dbRun('DELETE FROM family_meeting_memberships WHERE familyId = ? AND userId = ?', [familyId, id])
+
+    console.log(`[family-meeting] 管理员 ${req.userId} 踢出成员 ${targetMember.name}(${id})`)
+    res.json({ success: true, message: `已踢出成员「${targetMember.name}」` })
+  } catch (err) {
+    console.error(`[family-meeting] DELETE /members/:id/kick 失败 (userId=${req.userId}):`, err)
+    res.status(500).json({ success: false, error: '踢出失败' })
   }
 })
 
@@ -850,67 +1122,12 @@ router.post('/invite/generate', authRequired, (req, res) => {
   }
 })
 
-/** 通过邀请码加入家庭 — 需登录；支持 deleteExisting 删除旧空间后加入 */
+/** 通过邀请码加入家庭 — 需登录；多家庭模式：默认直接加入，不删除旧家庭 */
 router.post('/invite/join', authRequired, (req, res) => {
   try {
     const { inviteCode, userName, deleteExisting } = req.body
     if (!inviteCode || !userName) {
       return res.status(400).json({ success: false, error: '缺少邀请码或用户名' })
-    }
-
-    // 🔒 检查当前用户是否已属于某个家庭
-    const currentFamilyId = getFamilyId(req.userId)
-    if (currentFamilyId) {
-      // 遍历所有家庭状态，查找匹配的邀请码
-      const allRows = dbAll('SELECT familyId, state FROM family_meeting_state')
-      let targetFamilyId = null
-      for (const row of allRows) {
-        try {
-          const s = JSON.parse(row.state)
-          if (s.family?.inviteCode?.toUpperCase() === inviteCode.toUpperCase()) {
-            targetFamilyId = row.familyId
-            break
-          }
-        } catch { /* skip */ }
-      }
-
-      // 如果要加入的就是当前家庭
-      if (targetFamilyId && targetFamilyId === currentFamilyId) {
-        return res.status(400).json({ success: false, error: '不能加入自己的家庭空间' })
-      }
-
-      // 获取当前家庭名称
-      let currentFamilyName = '未知'
-      const currentRow = dbGet('SELECT state FROM family_meeting_state WHERE familyId = ?', [currentFamilyId])
-      if (currentRow?.state) {
-        try {
-          currentFamilyName = JSON.parse(currentRow.state)?.family?.name || '未知'
-        } catch { }
-      }
-
-      if (!deleteExisting) {
-        return res.json({
-          success: false,
-          needConfirm: true,
-          existingFamily: { name: currentFamilyName },
-          error: `你当前已有家庭空间「${currentFamilyName}」，加入新空间将离开当前空间`
-        })
-      }
-
-      // 🔥 确认离开当前家庭：删除 membership
-      dbRun('DELETE FROM family_meeting_memberships WHERE userId = ?', [req.userId])
-
-      // 检查旧家庭是否还有其他成员，没有则清理 state
-      const remainingMembers = dbGet(
-        'SELECT COUNT(*) as cnt FROM family_meeting_memberships WHERE familyId = ?',
-        [currentFamilyId]
-      )
-      if (!remainingMembers || remainingMembers.cnt === 0) {
-        dbRun('DELETE FROM family_meeting_state WHERE familyId = ?', [currentFamilyId])
-        console.log(`[family-meeting] 家庭 ${currentFamilyId} 无剩余成员，已清理`)
-      }
-
-      console.log(`[family-meeting] 用户 ${req.userId} 离开旧家庭「${currentFamilyName}」`)
     }
 
     // 遍历所有家庭状态，查找匹配的邀请码
@@ -933,7 +1150,21 @@ router.post('/invite/join', authRequired, (req, res) => {
       return res.status(400).json({ success: false, error: '邀请码无效或家庭空间不存在' })
     }
 
-    // 检查是否已是成员（按名称）
+    // 🔒 检查当前用户是否已属于目标家庭
+    const existingMembership = dbGet(
+      'SELECT role, memberName FROM family_meeting_memberships WHERE familyId = ? AND userId = ?',
+      [targetFamilyId, req.userId]
+    )
+
+    if (existingMembership) {
+      return res.json({
+        success: true,
+        data: { family: targetState.family, existingMember: { name: existingMembership.memberName } },
+        message: '你已经是该家庭的成员'
+      })
+    }
+
+    // 🔒 检查是否已有同名成员
     const exists = targetState.members.find(m => m.name === userName.trim())
     if (exists) {
       // 确保 membership 存在
@@ -943,9 +1174,16 @@ router.post('/invite/join', authRequired, (req, res) => {
       )
       return res.json({
         success: true,
-        data: { ...targetState.family, existingMember: exists },
-        message: '你已经是该家庭的成员'
+        data: { family: targetState.family, existingMember: exists },
+        message: '你已经是该家庭的成员（同名匹配）'
       })
+    }
+
+    // 多家庭模式：不再需要 deleteExisting，直接加入。仅当 deleteExisting=true 时才处理旧家庭。
+    // 注意：保留 deleteExisting 以兼容旧版前端
+    if (deleteExisting) {
+      dbRun('DELETE FROM family_meeting_memberships WHERE userId = ?', [req.userId])
+      console.log(`[family-meeting] 用户 ${req.userId} 删除了所有旧家庭成员关系（deleteExisting=true）`)
     }
 
     // 添加新成员到共享状态（使用 auth userId 作为成员 ID，确保与前端 authUserId 一致）
@@ -963,7 +1201,7 @@ router.post('/invite/join', authRequired, (req, res) => {
       [targetFamilyId, JSON.stringify(targetState)]
     )
 
-    // 🔑 关键修复：为加入者创建 membership 记录，使其能访问共享的家庭数据
+    // 🔑 为加入者创建 membership 记录
     dbRun(
       'INSERT OR IGNORE INTO family_meeting_memberships (id, familyId, userId, memberName, role, joinedAt) VALUES (?, ?, ?, ?, ?, ?)',
       [uid('ms'), targetFamilyId, req.userId, userName.trim(), 'member', new Date().toISOString()]
@@ -977,7 +1215,108 @@ router.post('/invite/join', authRequired, (req, res) => {
   }
 })
 
-// ==================== 语音转写 ====================
+// ==================== 🎤 声纹识别 ====================
+
+/**
+ * 获取家庭所有成员的声纹状态
+ * GET /family-meeting/voiceprints?familyId=xxx
+ */
+router.get('/voiceprints', authRequired, (req, res) => {
+  try {
+    const { familyId } = req.query
+    const targetFamilyId = familyId || getFamilyId(req.userId)
+    if (!targetFamilyId) {
+      return res.json({ success: true, data: [] })
+    }
+    const vps = listVoiceprints(targetFamilyId)
+    res.json({ success: true, data: vps })
+  } catch (err) {
+    console.error(`[family-meeting] GET /voiceprints 失败:`, err)
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+/**
+ * 查询某成员的声纹状态
+ * GET /family-meeting/members/:id/voiceprint/status?familyId=xxx
+ */
+router.get('/members/:id/voiceprint/status', authRequired, (req, res) => {
+  try {
+    const { familyId } = req.query
+    const targetFamilyId = familyId || getFamilyId(req.userId)
+    if (!targetFamilyId) {
+      return res.json({ success: true, data: { enrolled: false } })
+    }
+    const status = getVoiceprintStatus(targetFamilyId, req.params.id)
+    res.json({ success: true, data: status })
+  } catch (err) {
+    console.error(`[family-meeting] GET voiceprint/status 失败:`, err)
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+/**
+ * 注册声纹 — 上传音频样本，提取声纹特征
+ * POST /family-meeting/members/:id/voiceprint/enroll
+ * multipart/form-data: audio=音频文件, familyId=家庭ID, memberName=成员名称
+ */
+router.post('/members/:id/voiceprint/enroll', authRequired, upload.single('audio'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ success: false, error: '请上传音频文件（10-15秒语音样本）' })
+  }
+
+  const memberId = req.params.id
+  const { familyId, memberName } = req.body
+  const targetFamilyId = familyId || getFamilyId(req.userId)
+
+  if (!targetFamilyId) {
+    return res.status(400).json({ success: false, error: '请先创建/加入家庭空间' })
+  }
+
+  try {
+    const result = await enrollVoiceprint({
+      familyId: targetFamilyId,
+      memberId,
+      memberName: memberName || '',
+      audioPath: req.file.path
+    })
+
+    // 清理上传的音频文件
+    try { cleanupTempFiles(req.file.path) } catch { }
+
+    if (result.success) {
+      console.log(`[family-meeting] 声纹注册成功: member=${memberName || memberId}, familyId=${targetFamilyId}`)
+      res.json({ success: true, data: result.data })
+    } else {
+      res.status(500).json({ success: false, error: result.error })
+    }
+  } catch (err) {
+    console.error(`[family-meeting] 声纹注册失败:`, err)
+    try { cleanupTempFiles(req.file.path) } catch { }
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+/**
+ * 删除成员的声纹
+ * DELETE /family-meeting/members/:id/voiceprint?familyId=xxx
+ */
+router.delete('/members/:id/voiceprint', authRequired, (req, res) => {
+  try {
+    const { familyId } = req.query
+    const targetFamilyId = familyId || getFamilyId(req.userId)
+    if (!targetFamilyId) {
+      return res.status(400).json({ success: false, error: '请先创建/加入家庭空间' })
+    }
+    const result = deleteVoiceprint(targetFamilyId, req.params.id)
+    res.json(result)
+  } catch (err) {
+    console.error(`[family-meeting] DELETE voiceprint 失败:`, err)
+    res.status(500).json({ success: false, error: err.message })
+  }
+})
+
+// ==================== 语音转写（增强：支持说话人识别） ====================
 
 router.get('/transcribe/engines', async (_req, res) => {
   try {
@@ -997,18 +1336,46 @@ router.post('/transcribe', upload.single('audio'), async (req, res) => {
     ? req.body.hotwords.split(',').map(w => w.trim()).filter(Boolean)
     : []
 
+  const withDiarization = req.body.withDiarization === 'true' || req.body.withDiarization === true
+  const targetFamilyId = req.body.familyId || getFamilyId(req.userId)
+
+  // ⚠️ 先持有 file.path，防止 cleanup 后无法访问
+  const audioPath = req.file.path
+
   try {
-    const result = await transcribe(req.file.path, {
+    // 1. 语音转写
+    const result = await transcribe(audioPath, {
       language: req.body.language || 'zh',
       hotwords
     })
+
+    // 2. 如果请求说话人识别且有家庭ID，尝试识别
+    if (withDiarization && targetFamilyId && result.segments && result.segments.length > 0) {
+      try {
+        const speakerResult = await identifySpeakers({
+          audioPath,
+          segments: result.segments,
+          familyId: targetFamilyId,
+          threshold: parseFloat(req.body.threshold) || 0.5
+        })
+
+        if (speakerResult.success) {
+          result.diarization = speakerResult.summary
+          result.segments = speakerResult.segments
+        }
+      } catch (diarErr) {
+        console.warn('[family-meeting] 说话人识别失败（不影响转写结果）:', diarErr.message)
+        result.diarizationWarning = diarErr.message
+      }
+    }
+
     res.json({ success: true, data: result })
   } catch (err) {
     console.error('[family-meeting] 转写失败:', err.message)
     res.status(500).json({ success: false, error: err.message })
   } finally {
-    if (req.file?.path) {
-      cleanupTempFiles(req.file.path)
+    if (audioPath) {
+      cleanupTempFiles(audioPath)
     }
   }
 })

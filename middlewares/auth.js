@@ -35,13 +35,21 @@ function getUserIdFromToken(token) {
 
 /**
  * 读取用户信息（不含敏感字段）
+ * 兼容新旧数据库结构：动态检测 username 列是否存在
  */
 function getUserById(userId) {
   try {
-    const user = dbGet(
-      'SELECT userId, email, nickname, createdAt, lastLogin FROM users WHERE userId = ?',
-      [userId]
-    )
+    let hasUsernameCol = false
+    try {
+      const cols = dbAll("PRAGMA table_info('users')")
+      hasUsernameCol = cols.some(c => c.name === 'username')
+    } catch { /* 忽略 */ }
+
+    const sql = hasUsernameCol
+      ? 'SELECT userId, email, username, nickname, createdAt, lastLogin FROM users WHERE userId = ?'
+      : 'SELECT userId, email, nickname, createdAt, lastLogin FROM users WHERE userId = ?'
+
+    const user = dbGet(sql, [userId])
     return user || null
   } catch {
     return null

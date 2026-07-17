@@ -3,7 +3,7 @@ import bcrypt from 'bcryptjs'
 import crypto from 'crypto'
 import nodemailer from 'nodemailer'
 import { authRequired, generateJwt } from '../middlewares/auth.js'
-import { dbGet, dbRun, updateUser } from '../services/db.js'
+import { dbGet, dbAll, dbRun, updateUser } from '../services/db.js'
 
 const router = Router()
 
@@ -83,6 +83,14 @@ function findUserByUsername(username) {
   return dbGet('SELECT * FROM users WHERE username = ?', [username])
 }
 
+/** 根据昵称查找用户（排除指定userId） */
+function findUserByNickname(nickname, excludeUserId = null) {
+  if (excludeUserId) {
+    return dbGet('SELECT * FROM users WHERE nickname = ? AND userId != ?', [nickname, excludeUserId])
+  }
+  return dbGet('SELECT * FROM users WHERE nickname = ?', [nickname])
+}
+
 // ==================== 注册 ====================
 
 /**
@@ -134,6 +142,11 @@ router.post('/register', (req, res) => {
         return res.status(409).json({ error: '该用户名已被使用' })
       }
 
+      // 检查昵称是否已被使用
+      if (findUserByNickname(nickname.trim())) {
+        return res.status(409).json({ error: '该昵称已被使用' })
+      }
+
       // 创建新用户
       const userId = `u_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`
       const salt = bcrypt.genSaltSync(10)
@@ -181,6 +194,11 @@ router.post('/register', (req, res) => {
       // 检查邮箱是否已被注册
       if (findUserByEmail(email)) {
         return res.status(409).json({ error: '该邮箱已被注册' })
+      }
+
+      // 检查昵称是否已被使用
+      if (findUserByNickname(nickname.trim())) {
+        return res.status(409).json({ error: '该昵称已被使用' })
       }
 
       // 创建新用户
@@ -274,13 +292,22 @@ router.post('/login', (req, res) => {
 
 /**
  * GET /auth/profile
+ * 兼容新旧数据库结构：动态检测 username 列是否存在
  */
 router.get('/profile', authRequired, (req, res) => {
   try {
-    const user = dbGet(
-      'SELECT userId, email, username, nickname, createdAt, lastLogin FROM users WHERE userId = ?',
-      [req.userId]
-    )
+    // 检测 users 表是否有 username 列（兼容旧数据库）
+    let hasUsernameCol = false
+    try {
+      const cols = dbAll("PRAGMA table_info('users')")
+      hasUsernameCol = cols.some(c => c.name === 'username')
+    } catch { /* 忽略，按无 username 处理 */ }
+
+    const sql = hasUsernameCol
+      ? 'SELECT userId, email, username, nickname, createdAt, lastLogin FROM users WHERE userId = ?'
+      : 'SELECT userId, email, nickname, createdAt, lastLogin FROM users WHERE userId = ?'
+
+    const user = dbGet(sql, [req.userId])
     if (!user) {
       return res.status(404).json({ error: '用户不存在' })
     }
@@ -314,16 +341,41 @@ router.put('/update-profile', authRequired, (req, res) => {
       return res.status(404).json({ error: '用户不存在' })
     }
 
-    updateUser(req.userId, { nickname: nickname.trim() })
+    // 检查昵称是否已被其他用户使用
+    const trimmedNickname = nickname.trim()
+    const existing = findUserByNickname(trimmedNickname, req.userId)
+    if (existing) {
+      return res.status(409).json({ error: '该昵称已被其他用户使用' })
+    }
+
+    updateUser(req.userId, { nickname: trimmedNickname })
 
     res.json({
       success: true,
-      data: { nickname: nickname.trim() },
+      data: { nickname: trimmedNickname },
       message: '个人资料更新成功'
     })
   } catch (err) {
     console.error('[Auth] 更新资料失败:', err.message)
     res.status(500).json({ error: '更新资料失败，请稍后重试' })
+  }
+})
+
+/**
+ * POST /auth/check-nickname
+ * Body: { nickname } — 检查昵称是否可用
+ */
+router.post('/check-nickname', (req, res) => {
+  try {
+    const { nickname } = req.body
+    if (!nickname || nickname.trim().length < 2 || nickname.trim().length > 20) {
+      return res.status(400).json({ success: false, error: '昵称长度应为2-20个字符' })
+    }
+    const existing = findUserByNickname(nickname.trim())
+    res.json({ success: true, available: !existing })
+  } catch (err) {
+    console.error('[Auth] 检查昵称失败:', err.message)
+    res.status(500).json({ error: '检查失败' })
   }
 })
 
@@ -515,6 +567,54 @@ router.post('/reset-password-username', (req, res) => {
   } catch (err) {
     console.error('[Auth] 重置密码失败（用户名）:', err.message)
     res.status(500).json({ error: '重置密码失败，请稍后重试' })
+  }
+})
+
+// ==================== 用户搜索（用于添加家庭成员） ====================
+
+/**
+ * GET /auth/users/search?q=keyword
+ * 搜索已注册用户，用于添加家庭成员时查找
+ */
+router.get('/users/search', authRequired, (req, res) => {
+  try {
+    const { q } = req.query
+    if (!q || q.trim().length === 0) {
+      return res.json({ success: true, data: [] })
+    }
+
+    const keyword = `%${q.trim()}%`
+
+    // 检测 users 表是否有 username 列（兼容旧数据库）
+    let hasUsernameCol = false
+    try {
+      const cols = dbAll("PRAGMA table_info('users')")
+      hasUsernameCol = cols.some(c => c.name === 'username')
+    } catch { /* 忽略，按无 username 处理 */ }
+
+    let rows
+    if (hasUsernameCol) {
+      rows = dbAll(
+        'SELECT userId, nickname FROM users WHERE (nickname LIKE ? OR username LIKE ?) AND userId != ? LIMIT 20',
+        [keyword, keyword, req.userId]
+      )
+    } else {
+      rows = dbAll(
+        'SELECT userId, nickname FROM users WHERE nickname LIKE ? AND userId != ? LIMIT 20',
+        [keyword, req.userId]
+      )
+    }
+
+    res.json({
+      success: true,
+      data: (rows || []).map(r => ({
+        userId: r.userId,
+        nickname: r.nickname
+      }))
+    })
+  } catch (err) {
+    console.error('[Auth] 搜索用户失败:', err.message)
+    res.status(500).json({ success: false, error: '搜索失败' })
   }
 })
 
