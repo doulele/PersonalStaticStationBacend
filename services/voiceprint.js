@@ -20,6 +20,7 @@
 import { spawn } from 'child_process'
 import fs from 'fs'
 import path from 'path'
+import os from 'os'
 import { fileURLToPath } from 'url'
 import { dbAll, dbGet, dbRun, getFamilyId } from './db.js'
 
@@ -37,18 +38,62 @@ if (!fs.existsSync(DATA_DIR)) {
 // ==================== Python 命令查找 ====================
 
 async function findPython() {
-  for (const cmd of ['python', 'python3', 'python3.10', 'python3.11', 'python3.12']) {
+  let lastError = null
+
+  // 优先尝试已知的绝对路径（pm2 环境下 PATH 可能不完整）
+  const knownPaths = [
+    '/usr/local/bin/python3.10',
+    '/usr/local/python3.10/bin/python3.10',
+    '/usr/bin/python3.10',
+    '/usr/bin/python3'
+  ]
+  for (const p of knownPaths) {
+    console.log(`[voiceprint] 检查 Python 路径: ${p}, exists=${fs.existsSync(p)}`)
+    if (fs.existsSync(p)) {
+      try {
+        await execPromise(p, ['--version'], 5000)
+        console.log(`[voiceprint] ✓ 找到 Python: ${p}`)
+        return p
+      } catch (e) {
+        lastError = e.message
+        console.log(`[voiceprint] 路径 ${p} 存在但 --version 失败: ${lastError}`)
+      }
+    }
+  }
+
+  // 回退到 PATH 查找
+  for (const cmd of ['python3.10', 'python3', 'python']) {
+    console.log(`[voiceprint] 尝试 PATH 命令: ${cmd}`)
     try {
       await execPromise(cmd, ['--version'], 5000)
+      console.log(`[voiceprint] ✓ 通过 PATH 找到 Python: ${cmd}`)
       return cmd
-    } catch { /* 继续尝试 */ }
+    } catch (e) {
+      lastError = e.message
+      console.log(`[voiceprint] 命令 ${cmd} 失败: ${lastError}`)
+    }
   }
+
   // 检查 venv
   const venvPython = process.platform === 'win32'
     ? path.join(__dirname, '..', 'venv', 'Scripts', 'python.exe')
     : path.join(__dirname, '..', 'venv', 'bin', 'python')
-  if (fs.existsSync(venvPython)) return venvPython
-  // 返回 null 表示未找到 Python
+  console.log(`[voiceprint] 检查 venv: ${venvPython}, exists=${fs.existsSync(venvPython)}`)
+  if (fs.existsSync(venvPython)) {
+    console.log(`[voiceprint] ✓ 使用 venv Python: ${venvPython}`)
+    return venvPython
+  }
+
+  // 最后兜底：直接用已知路径（不验证 --version）
+  // 即使 spawn --version 失败，Python 脚本本身可能可以运行
+  for (const p of knownPaths) {
+    if (fs.existsSync(p)) {
+      console.log(`[voiceprint] ⚠ --version 验证失败，但直接使用已知路径: ${p}`)
+      return p
+    }
+  }
+
+  console.error('[voiceprint] ✗ 未找到任何 Python 环境，最后错误:', lastError)
   return null
 }
 
@@ -94,6 +139,33 @@ export async function enrollVoiceprint({ familyId, memberId, memberName, audioPa
 
   ensureVoiceprintTable()
 
+  // 浏览器 MediaRecorder 默认录制 webm/opus，librosa/soundfile 不支持
+  // 需要先用 ffmpeg 转换为 16kHz 单声道 WAV
+  let convertedPath = null
+  const ext = path.extname(audioPath).toLowerCase()
+  const needsConversion = ext === '.webm' || ext === '.ogg' || ext === '.opus'
+
+  if (needsConversion) {
+    console.log('[voiceprint] 检测到 webm/opus 格式，使用 ffmpeg 转换为 WAV...')
+    convertedPath = path.join(os.tmpdir(), `vp_${Date.now()}_${Math.random().toString(36).slice(2, 6)}.wav`)
+    try {
+      await execPromise('ffmpeg', [
+        '-y', '-i', audioPath,
+        '-ar', '16000',        // 16kHz 采样率
+        '-ac', '1',            // 单声道
+        '-sample_fmt', 's16',  // 16-bit PCM
+        '-f', 'wav',
+        convertedPath
+      ], 30000)
+      console.log('[voiceprint] ffmpeg 转换完成:', convertedPath)
+    } catch (ffErr) {
+      console.error('[voiceprint] ffmpeg 转换失败:', ffErr.message)
+      return { success: false, error: `音频格式转换失败（webm→wav）。请确保服务器已安装 ffmpeg: ${ffErr.message}` }
+    }
+  }
+
+  const effectiveAudioPath = convertedPath || audioPath
+
   const pythonCmd = await findPython()
   if (!pythonCmd) {
     return {
@@ -117,18 +189,18 @@ export async function enrollVoiceprint({ familyId, memberId, memberName, audioPa
     try {
       const res = await execPromise(pythonCmd, [
         ENROLL_SCRIPT,
-        '--audio', audioPath,
+        '--audio', effectiveAudioPath,
         '--engine', 'speechbrain'
       ], 120000)
-      result = JSON.parse(res.stdout)
+      result = parsePythonJson(res.stdout)
     } catch (e) {
       // speechbrain 失败，尝试 resemblyzer
       const fallback = await execPromise(pythonCmd, [
         ENROLL_SCRIPT,
-        '--audio', audioPath,
+        '--audio', effectiveAudioPath,
         '--engine', 'resemblyzer'
       ], 60000)
-      result = JSON.parse(fallback.stdout)
+      result = parsePythonJson(fallback.stdout)
       engine = 'resemblyzer'
     }
 
@@ -167,6 +239,11 @@ export async function enrollVoiceprint({ familyId, memberId, memberName, audioPa
   } catch (err) {
     console.error('[voiceprint] 注册失败:', err.message)
     return { success: false, error: err.message }
+  } finally {
+    // 清理 ffmpeg 转换的临时 WAV 文件
+    if (convertedPath && fs.existsSync(convertedPath)) {
+      try { fs.unlinkSync(convertedPath) } catch { }
+    }
   }
 }
 
@@ -289,7 +366,7 @@ export async function identifySpeakers({ audioPath, segments, familyId, threshol
       '--threshold', String(threshold)
     ], 300000) // 5分钟超时
 
-    return JSON.parse(result.stdout)
+    return parsePythonJson(result.stdout)
   } catch (err) {
     console.error('[voiceprint] 说话人识别失败:', err.message)
     return {
@@ -302,6 +379,23 @@ export async function identifySpeakers({ audioPath, segments, familyId, threshol
 }
 
 // ==================== 工具函数 ====================
+
+/**
+ * 从 Python 脚本的 stdout 中安全提取 JSON 结果
+ * Python 可能输出模型加载信息等额外内容，需要提取最后一组有效的 JSON
+ */
+function parsePythonJson(stdout) {
+  const trimmed = stdout.trim()
+  // 直接尝试解析
+  try { return JSON.parse(trimmed) } catch {}
+  // 找到第一个 { 和最后一个 }，提取 JSON 子串
+  const start = trimmed.indexOf('{')
+  const end = trimmed.lastIndexOf('}')
+  if (start !== -1 && end !== -1 && end > start) {
+    return JSON.parse(trimmed.slice(start, end + 1))
+  }
+  throw new Error(`无法解析 Python 输出: ${trimmed.slice(0, 200)}`)
+}
 
 function execPromise(cmd, args = [], timeout = 30000) {
   return new Promise((resolve, reject) => {

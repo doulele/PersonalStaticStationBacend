@@ -48,13 +48,44 @@ def extract_embedding_speechbrain(audio_path):
 
 
 # ===== 方案B: Resemblyzer (轻量方案) =====
+def _read_wav_scipy(audio_path):
+    """使用 scipy 读取 WAV 文件（避免 audioread 的 NoBackendError）"""
+    import numpy as np
+    from scipy.io import wavfile
+    sr, wav = wavfile.read(audio_path)
+    if wav.dtype == np.int16:
+        wav = wav.astype(np.float32) / 32768.0
+    elif wav.dtype == np.int32:
+        wav = wav.astype(np.float32) / 2147483648.0
+    else:
+        wav = wav.astype(np.float32)
+    if wav.ndim > 1:
+        wav = wav.mean(axis=1)
+    return sr, wav
+
+
+def _read_wav_fallback(audio_path):
+    """降级方案：使用 Python 内置 wave 模块读取 WAV"""
+    import wave
+    import numpy as np
+    with wave.open(audio_path, 'rb') as wf:
+        sr = wf.getframerate()
+        n_frames = wf.getnframes()
+        n_channels = wf.getnchannels()
+        wav_data = wf.readframes(n_frames)
+        wav = np.frombuffer(wav_data, dtype=np.int16).astype(np.float32) / 32768.0
+        if n_channels > 1:
+            wav = wav.reshape(-1, n_channels).mean(axis=1)
+    return sr, wav
+
+
 def extract_embedding_resemblyzer(audio_path):
     """
     使用 Resemblyzer 提取声纹特征向量 (轻量依赖，推荐作为备选)
     pip install resemblyzer
     """
     try:
-        import librosa
+        import numpy as np
         from resemblyzer import VoiceEncoder
     except ImportError:
         raise ImportError(
@@ -64,13 +95,28 @@ def extract_embedding_resemblyzer(audio_path):
         )
 
     encoder = VoiceEncoder()
-    # 加载音频 (16kHz)
-    wav, sr = librosa.load(audio_path, sr=16000)
+
+    # 读取 WAV：优先 scipy，fallback 到内置 wave 模块
+    # 不再依赖 librosa/audioread，避免 NoBackendError
+    try:
+        sr, wav = _read_wav_scipy(audio_path)
+    except (ImportError, Exception):
+        sr, wav = _read_wav_fallback(audio_path)
+
+    # 如果采样率不是 16kHz，重采样
+    if sr != 16000:
+        try:
+            from scipy.signal import resample
+            new_len = int(len(wav) * 16000 / sr)
+            wav = resample(wav, new_len)
+        except ImportError:
+            raise RuntimeError(f"音频采样率为 {sr}Hz，需要 scipy 进行重采样。请执行: pip install scipy")
 
     # 取音频中间 10 秒（最稳定的部分）
-    if len(wav) > sr * 15:
-        start = sr * 2  # 跳过前2秒
-        wav = wav[start:start + sr * 10]
+    sample_rate = 16000
+    if len(wav) > sample_rate * 15:
+        start = sample_rate * 2  # 跳过前2秒
+        wav = wav[start:start + sample_rate * 10]
 
     embedding = encoder.embed_utterance(wav)
     return embedding.tolist()

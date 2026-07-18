@@ -6,7 +6,7 @@
  */
 import { Router } from 'express'
 import { existsSync, mkdirSync, unlinkSync } from 'fs'
-import { join, dirname } from 'path'
+import { join, dirname, extname } from 'path'
 import { fileURLToPath } from 'url'
 import multer from 'multer'
 import { transcribe, detectEngines, cleanupTempFiles } from '../services/whisper.js'
@@ -28,8 +28,15 @@ const __dirname = dirname(__filename)
 const uploadDir = join(__dirname, '..', 'data', 'uploads')
 if (!existsSync(uploadDir)) mkdirSync(uploadDir, { recursive: true })
 
+const storage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, uploadDir),
+  filename: (_req, file, cb) => {
+    const ext = extname(file.originalname) || '.webm'
+    cb(null, Date.now().toString(36) + Math.random().toString(36).slice(2, 8) + ext)
+  }
+})
 const upload = multer({
-  dest: uploadDir,
+  storage,
   limits: { fileSize: 50 * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
     const allowed = ['audio/webm', 'audio/wav', 'audio/mp3', 'audio/mpeg', 'audio/ogg', 'audio/mp4', 'audio/x-m4a', 'application/octet-stream']
@@ -1327,7 +1334,7 @@ router.get('/transcribe/engines', async (_req, res) => {
   }
 })
 
-router.post('/transcribe', upload.single('audio'), async (req, res) => {
+router.post('/transcribe', authRequired, upload.single('audio'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ success: false, error: '未上传音频文件' })
   }
@@ -1338,6 +1345,16 @@ router.post('/transcribe', upload.single('audio'), async (req, res) => {
 
   const withDiarization = req.body.withDiarization === 'true' || req.body.withDiarization === true
   const targetFamilyId = req.body.familyId || getFamilyId(req.userId)
+
+  // 诊断日志
+  console.log('[family-meeting] transcribe 请求:', {
+    withDiarization,
+    targetFamilyId,
+    bodyFamilyId: req.body.familyId,
+    userId: req.userId,
+    fileType: req.file.mimetype,
+    fileSize: req.file.size
+  })
 
   // ⚠️ 先持有 file.path，防止 cleanup 后无法访问
   const audioPath = req.file.path
@@ -1359,14 +1376,38 @@ router.post('/transcribe', upload.single('audio'), async (req, res) => {
           threshold: parseFloat(req.body.threshold) || 0.5
         })
 
+        console.log('[family-meeting] identifySpeakers 结果:', {
+          success: speakerResult.success,
+          note: speakerResult.note || '',
+          error: speakerResult.error || '',
+          matched: speakerResult.summary?.matched ?? 0,
+          total: speakerResult.summary?.total ?? 0
+        })
+
         if (speakerResult.success) {
-          result.diarization = speakerResult.summary
+          // 将声纹标注的 segments 合并到 diarization 中，前端从 diarization.segments 读取
+          result.diarization = {
+            ...speakerResult.summary,
+            segments: speakerResult.segments
+          }
           result.segments = speakerResult.segments
+          if (speakerResult.note) {
+            result.diarizationNote = speakerResult.note
+          }
+        } else {
+          result.diarizationError = speakerResult.error || '说话人识别失败'
+          console.warn('[family-meeting] 说话人识别失败:', speakerResult.error)
         }
       } catch (diarErr) {
         console.warn('[family-meeting] 说话人识别失败（不影响转写结果）:', diarErr.message)
-        result.diarizationWarning = diarErr.message
+        result.diarizationError = diarErr.message
       }
+    } else {
+      console.log('[family-meeting] 跳过说话人识别:', {
+        withDiarization,
+        hasFamilyId: !!targetFamilyId,
+        segmentsCount: result.segments?.length || 0
+      })
     }
 
     res.json({ success: true, data: result })
