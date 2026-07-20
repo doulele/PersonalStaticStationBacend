@@ -201,6 +201,10 @@ function migrateUsersTable() {
       _db.run('ALTER TABLE users ADD COLUMN securityAnswerHash TEXT')
       console.log('[DB] 已添加 users.securityAnswerHash 列')
     }
+    if (!columns.includes('avatar')) {
+      _db.run('ALTER TABLE users ADD COLUMN avatar TEXT DEFAULT NULL')
+      console.log('[DB] 已添加 users.avatar 列')
+    }
   } catch (e) {
     console.error('[DB] 迁移 users 表失败:', e.message)
   }
@@ -219,7 +223,8 @@ function createTables() {
       tokens    TEXT DEFAULT '[]',
       username  TEXT UNIQUE,
       securityQuestion TEXT,
-      securityAnswerHash TEXT
+      securityAnswerHash TEXT,
+      avatar    TEXT DEFAULT NULL
     )
   `)
 

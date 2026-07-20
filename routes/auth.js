@@ -1,11 +1,56 @@
 import { Router } from 'express'
 import bcrypt from 'bcryptjs'
 import crypto from 'crypto'
+import path from 'path'
+import fs from 'fs'
+import { fileURLToPath } from 'url'
+import multer from 'multer'
 import nodemailer from 'nodemailer'
 import { authRequired, generateJwt } from '../middlewares/auth.js'
 import { dbGet, dbAll, dbRun, updateUser } from '../services/db.js'
 
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
+
 const router = Router()
+
+// ==================== Multer 头像上传配置 ====================
+
+const AVATARS_DIR = path.join(__dirname, '..', 'public', 'avatars')
+
+// 确保 avatars 目录存在
+if (!fs.existsSync(AVATARS_DIR)) {
+  fs.mkdirSync(AVATARS_DIR, { recursive: true })
+}
+
+const avatarStorage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, AVATARS_DIR)
+  },
+  filename: (req, file, cb) => {
+    const userId = req.userId || 'unknown'
+    const ext = path.extname(file.originalname).toLowerCase() || '.jpg'
+    const timestamp = Date.now()
+    const random = Math.random().toString(36).slice(2, 8)
+    const filename = `${userId}_${timestamp}_${random}${ext}`
+    cb(null, filename)
+  }
+})
+
+const avatarUpload = multer({
+  storage: avatarStorage,
+  limits: {
+    fileSize: 2 * 1024 * 1024 // 2MB
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedMimes = ['image/jpeg', 'image/png', 'image/webp']
+    if (allowedMimes.includes(file.mimetype)) {
+      cb(null, true)
+    } else {
+      cb(new Error('仅支持 JPEG、PNG、WebP 格式的图片'), false)
+    }
+  }
+})
 
 // ==================== 验证码存储（内存，重启后清空） ====================
 const resetCodeStore = new Map()
@@ -298,14 +343,19 @@ router.get('/profile', authRequired, (req, res) => {
   try {
     // 检测 users 表是否有 username 列（兼容旧数据库）
     let hasUsernameCol = false
+    let hasAvatarCol = false
     try {
       const cols = dbAll("PRAGMA table_info('users')")
       hasUsernameCol = cols.some(c => c.name === 'username')
+      hasAvatarCol = cols.some(c => c.name === 'avatar')
     } catch { /* 忽略，按无 username 处理 */ }
 
-    const sql = hasUsernameCol
-      ? 'SELECT userId, email, username, nickname, createdAt, lastLogin FROM users WHERE userId = ?'
-      : 'SELECT userId, email, nickname, createdAt, lastLogin FROM users WHERE userId = ?'
+    const selectFields = ['userId', 'email']
+    if (hasUsernameCol) selectFields.push('username')
+    selectFields.push('nickname', 'createdAt', 'lastLogin')
+    if (hasAvatarCol) selectFields.push('avatar')
+
+    const sql = `SELECT ${selectFields.join(', ')} FROM users WHERE userId = ?`
 
     const user = dbGet(sql, [req.userId])
     if (!user) {
@@ -615,6 +665,100 @@ router.get('/users/search', authRequired, (req, res) => {
   } catch (err) {
     console.error('[Auth] 搜索用户失败:', err.message)
     res.status(500).json({ success: false, error: '搜索失败' })
+  }
+})
+
+// ==================== 头像上传 ====================
+
+/**
+ * POST /auth/avatar
+ * 上传用户头像，需要登录
+ * Content-Type: multipart/form-data
+ * 字段名: avatar (文件)
+ */
+router.post('/avatar', authRequired, avatarUpload.single('avatar'), (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: '请选择要上传的图片' })
+    }
+
+    const avatarPath = '/avatars/' + req.file.filename
+
+    // 先删除旧头像文件
+    const user = dbGet('SELECT avatar FROM users WHERE userId = ?', [req.userId])
+    if (user && user.avatar) {
+      const oldFilename = user.avatar.replace('/avatars/', '')
+      const oldFilePath = path.join(AVATARS_DIR, oldFilename)
+      try {
+        if (fs.existsSync(oldFilePath)) {
+          fs.unlinkSync(oldFilePath)
+          console.log('[Auth] 已删除旧头像:', oldFilename)
+        }
+      } catch (e) {
+        console.warn('[Auth] 删除旧头像失败:', e.message)
+      }
+    }
+
+    // 更新数据库
+    updateUser(req.userId, { avatar: avatarPath })
+
+    res.json({
+      success: true,
+      data: { avatar: avatarPath }
+    })
+  } catch (err) {
+    console.error('[Auth] 上传头像失败:', err.message)
+    res.status(500).json({ error: '上传头像失败，请稍后重试' })
+  }
+}, (err, req, res, next) => {
+  // multer 错误处理
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: '文件大小不能超过 2MB' })
+    }
+    return res.status(400).json({ error: err.message })
+  }
+  if (err) {
+    return res.status(400).json({ error: err.message })
+  }
+  next()
+})
+
+/**
+ * DELETE /auth/avatar
+ * 删除用户头像，需要登录
+ */
+router.delete('/avatar', authRequired, (req, res) => {
+  try {
+    const user = dbGet('SELECT avatar FROM users WHERE userId = ?', [req.userId])
+    if (!user) {
+      return res.status(404).json({ error: '用户不存在' })
+    }
+
+    // 删除服务器上的头像文件
+    if (user.avatar) {
+      const filename = user.avatar.replace('/avatars/', '')
+      const filePath = path.join(AVATARS_DIR, filename)
+      try {
+        if (fs.existsSync(filePath)) {
+          fs.unlinkSync(filePath)
+          console.log('[Auth] 已删除头像文件:', filename)
+        }
+      } catch (e) {
+        console.warn('[Auth] 删除头像文件失败:', e.message)
+      }
+    }
+
+    // 清空数据库中的 avatar 字段
+    updateUser(req.userId, { avatar: null })
+
+    res.json({
+      success: true,
+      message: '头像已删除'
+    })
+  } catch (err) {
+    console.error('[Auth] 删除头像失败:', err.message)
+    res.status(500).json({ error: '删除头像失败，请稍后重试' })
   }
 })
 

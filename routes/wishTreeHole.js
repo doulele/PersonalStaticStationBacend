@@ -71,6 +71,44 @@ router.get('/wishes', authRequired, (req, res) => {
     if (category && category !== 'all') { sql += ' AND w.category = ?'; params.push(category) }
     sql += ' ORDER BY CASE WHEN w.targetDate IS NULL THEN 1 ELSE 0 END, w.targetDate ASC, w.createdAt DESC'
     const wishes = dbAll(sql, params)
+
+    // 检查即将到期的愿望，生成提醒通知
+    const now = new Date()
+    const threeDaysLater = new Date(now.getTime() + 3 * 86400000)
+    const todayStr = now.toISOString().slice(0, 10)
+    const threeDaysStr = threeDaysLater.toISOString().slice(0, 10)
+
+    for (const w of wishes) {
+      if (w.status !== '进行中' || !w.targetDate) continue
+      const targetDate = w.targetDate.slice(0, 10)
+      if (targetDate > threeDaysStr) continue // 超过3天，不提醒
+
+      // 检查今天是否已经生成过提醒（避免重复）
+      const existing = dbGet(
+        "SELECT id FROM notifications WHERE userId = ? AND type = 'reminder' AND relatedId = ? AND createdAt >= ?",
+        [w.userId, w.id, todayStr]
+      )
+      if (existing) continue
+
+      const daysLeft = Math.ceil((new Date(targetDate) - now) / 86400000)
+      let title, content
+      if (daysLeft <= 0) {
+        title = '⏰ 愿望已逾期'
+        content = `「${w.title}」已逾期，需要延期吗？`
+      } else if (daysLeft === 1) {
+        title = '⏰ 愿望明天到期'
+        content = `「${w.title}」明天就要截止了，加油冲刺！`
+      } else {
+        title = `⏰ 愿望还剩${daysLeft}天`
+        content = `「${w.title}」还剩${daysLeft}天，抓紧完成哦～`
+      }
+
+      dbRun(
+        'INSERT INTO notifications (id, userId, type, title, content, relatedId, createdAt) VALUES (?,?,?,?,?,?,?)',
+        [uid('n'), w.userId, 'reminder', title, content, w.id, nowISO()]
+      )
+    }
+
     const result = wishes.map(w => ({
       ...w,
       mediaLinks: JSON.parse(w.mediaLinks || '[]'),

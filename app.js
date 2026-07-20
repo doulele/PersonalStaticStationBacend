@@ -1,10 +1,15 @@
 import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
+import path from 'path'
+import { fileURLToPath } from 'url'
 import config from './config/index.js'
 import routes from './routes/index.js'
 import { errorHandler, notFoundHandler } from './middlewares/errorHandler.js'
 import { initDatabase } from './services/db.js'
+
+const __filename = fileURLToPath(import.meta.url)
+const __dirname = path.dirname(__filename)
 
 const app = express()
 
@@ -15,6 +20,12 @@ app.set('etag', false)
 app.use(cors({
   origin: ['http://wellwin.top', 'http://www.wellwin.top', 'http://localhost:3000', 'http://127.0.0.1:3000'],
   credentials: true
+}))
+
+// 静态文件服务 — 头像等上传资源
+app.use('/avatars', express.static(path.join(__dirname, 'public', 'avatars'), {
+  maxAge: '7d',
+  etag: true
 }))
 
 // 解析请求体（增大限制以支持 base64 图片/音频上传）
