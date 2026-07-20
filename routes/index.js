@@ -15,6 +15,9 @@ import familyRoutes from './family.js'
 import familyMeetingRoutes from './familyMeeting.js'
 import videoParseRoutes from './videoParse.js'
 import wishTreeHoleRoutes from './wishTreeHole.js'
+import taskAlchemistRoutes from './taskAlchemist.js'
+import eternalArchiveRoutes from './eternalArchive.js'
+import recipeLabRoutes from './recipeLab.js'
 
 const router = Router()
 
@@ -44,6 +47,9 @@ router.use('/family', familyRoutes)
 router.use('/family-meeting', familyMeetingRoutes)
 router.use('/video-parse', videoParseRoutes)
 router.use('/wish-tree-hole', wishTreeHoleRoutes)
+router.use('/task-alchemist', taskAlchemistRoutes)
+router.use('/eternal-archive', eternalArchiveRoutes)
+router.use('/recipe-lab', recipeLabRoutes)
 
 // 健康检查
 router.get('/health', (req, res) => {

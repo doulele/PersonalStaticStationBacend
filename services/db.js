@@ -439,6 +439,143 @@ function createTables() {
       FOREIGN KEY (userId) REFERENCES users(userId)
     )
   `)
+
+  // ========== 第二人生·任务炼金术士 相关表 ==========
+
+  // 用户设置（伙伴选择、日常作息、自由币等）
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS ta_settings (
+      id       TEXT PRIMARY KEY,
+      userId   TEXT UNIQUE NOT NULL,
+      settings TEXT,
+      FOREIGN KEY (userId) REFERENCES users(userId)
+    )
+  `)
+
+  // 任务列表
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS ta_tasks (
+      taskId    TEXT PRIMARY KEY,
+      userId    TEXT NOT NULL,
+      status    TEXT DEFAULT 'active',
+      taskData  TEXT,
+      createdAt TEXT,
+      updatedAt TEXT,
+      FOREIGN KEY (userId) REFERENCES users(userId)
+    )
+  `)
+
+  // 心流专注记录
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS ta_focus_sessions (
+      sessionId   TEXT PRIMARY KEY,
+      userId      TEXT NOT NULL,
+      sessionData TEXT,
+      createdAt   TEXT,
+      FOREIGN KEY (userId) REFERENCES users(userId)
+    )
+  `)
+
+  // 成就徽章
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS ta_achievements (
+      id           TEXT PRIMARY KEY,
+      userId       TEXT UNIQUE NOT NULL,
+      achievements TEXT,
+      FOREIGN KEY (userId) REFERENCES users(userId)
+    )
+  `)
+
+  // 记忆碎片
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS ta_fragments (
+      id        TEXT PRIMARY KEY,
+      userId    TEXT UNIQUE NOT NULL,
+      fragments TEXT,
+      FOREIGN KEY (userId) REFERENCES users(userId)
+    )
+  `)
+
+  // 传奇卡牌
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS ta_cards (
+      id      TEXT PRIMARY KEY,
+      userId  TEXT UNIQUE NOT NULL,
+      cards   TEXT,
+      FOREIGN KEY (userId) REFERENCES users(userId)
+    )
+  `)
+
+  // 日报/周报
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS ta_daily_reports (
+      id       TEXT PRIMARY KEY,
+      userId   TEXT UNIQUE NOT NULL,
+      reports  TEXT,
+      FOREIGN KEY (userId) REFERENCES users(userId)
+    )
+  `)
+
+  // ========== 永恒档案 相关表 ==========
+
+  // 文件档案
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS ea_files (
+      fileId      TEXT PRIMARY KEY,
+      userId      TEXT NOT NULL,
+      fileData    TEXT,
+      storagePath TEXT DEFAULT '',
+      fileHash    TEXT DEFAULT '',
+      fileSize    INTEGER DEFAULT 0,
+      mimeType    TEXT DEFAULT '',
+      status      TEXT DEFAULT 'active',
+      uploadDate  TEXT,
+      FOREIGN KEY (userId) REFERENCES users(userId)
+    )
+  `)
+
+  // 文件版本链
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS ea_file_versions (
+      id        TEXT PRIMARY KEY,
+      fileId    TEXT NOT NULL,
+      userId    TEXT NOT NULL,
+      versionId TEXT NOT NULL,
+      versionData TEXT,
+      storagePath TEXT DEFAULT '',
+      createdAt TEXT,
+      FOREIGN KEY (fileId) REFERENCES ea_files(fileId),
+      FOREIGN KEY (userId) REFERENCES users(userId)
+    )
+  `)
+
+  // 分享链接
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS ea_shares (
+      shareId   TEXT PRIMARY KEY,
+      userId    TEXT NOT NULL,
+      fileId    TEXT NOT NULL,
+      shareData TEXT,
+      createdAt TEXT,
+      status    TEXT DEFAULT 'active',
+      FOREIGN KEY (userId) REFERENCES users(userId),
+      FOREIGN KEY (fileId) REFERENCES ea_files(fileId)
+    )
+  `)
+
+  // 回收站
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS ea_recycle_bin (
+      id            TEXT PRIMARY KEY,
+      userId        TEXT NOT NULL,
+      fileId        TEXT NOT NULL,
+      fileData      TEXT,
+      storagePath   TEXT DEFAULT '',
+      deletedAt     TEXT,
+      retentionDays INTEGER DEFAULT 15,
+      FOREIGN KEY (userId) REFERENCES users(userId)
+    )
+  `)
 }
 
 // ==================== 持久化 ====================
