@@ -365,6 +365,7 @@ function createTables() {
       priority    TEXT DEFAULT '中',
       status      TEXT DEFAULT '进行中',
       progress    INTEGER DEFAULT 0,
+      targetCount INTEGER DEFAULT 5,
       targetDate  TEXT,
       createdAt   TEXT,
       updatedAt   TEXT,
@@ -376,6 +377,9 @@ function createTables() {
       FOREIGN KEY (userId) REFERENCES users(userId)
     )
   `)
+
+  // 为已有数据库添加 targetCount 列（迁移兼容）
+  try { _db.run('ALTER TABLE wishes ADD COLUMN targetCount INTEGER DEFAULT 5') } catch (e) { /* 列已存在 */ }
 
   // 愿望打卡记录
   _db.run(`
@@ -436,6 +440,21 @@ function createTables() {
       relatedId TEXT,
       isRead    INTEGER DEFAULT 0,
       createdAt TEXT,
+      FOREIGN KEY (userId) REFERENCES users(userId)
+    )
+  `)
+
+  // 树洞评论
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS mood_comments (
+      id           TEXT PRIMARY KEY,
+      moodId       TEXT NOT NULL,
+      userId       TEXT NOT NULL,
+      content      TEXT NOT NULL,
+      isAnonymous  INTEGER DEFAULT 1,
+      animalMask   TEXT DEFAULT '',
+      createdAt    TEXT,
+      FOREIGN KEY (moodId) REFERENCES moods(id),
       FOREIGN KEY (userId) REFERENCES users(userId)
     )
   `)

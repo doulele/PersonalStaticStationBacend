@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import axios from 'axios'
 import crypto from 'crypto'
+import https from 'https'
 import { execFile, exec } from 'child_process'
 import { promisify } from 'util'
 import HttpsProxyAgent from 'https-proxy-agent'
@@ -11,6 +12,26 @@ const execFileAsync = promisify(execFile)
 const execAsync = promisify(exec)
 
 const router = Router()
+
+// 忽略过期/自签名证书的 Agent（用于 tv.chen-dong.com 等证书过期的站点）
+const insecureAgent = new https.Agent({ rejectUnauthorized: false })
+
+// ==================== nnpp API 签名算法 ====================
+// 逆向自: m1-z2.cloud.nnpp.vip:2223/static/js/main.9c13c607.js
+function computeNnppSign() {
+  const now = new Date()
+  const localTime = new Date(now.getTime() + 60000 * now.getTimezoneOffset() + 3600000 * 8)
+  const dayOfMonth = localTime.getDate()
+  const dayOfWeek = localTime.getDay()
+
+  const raw = (dayOfMonth + 18) ^ 10
+  const hash1 = crypto.createHash('md5').update(String(raw), 'utf8').digest('hex')
+  const hash1_10 = hash1.substring(0, 10)
+  const z = crypto.createHash('md5').update(hash1_10, 'utf8').digest('hex')
+  const s1ig = dayOfWeek + 11397
+
+  return { z, s1ig }
+}
 
 // ==================== 搜索结果缓存 ====================
 // key: "平台:关键词" → { results, groups, ungrouped, timestamp }
@@ -215,6 +236,671 @@ async function checkAllApis() {
 
   return healthCache
 }
+
+// ==================== 搜索结果缓存（VIP 视频搜索 线路1/2） ====================
+const vipSearchCache = new Map()
+const VIP_SEARCH_CACHE_MAX = 200
+const VIP_SEARCH_CACHE_TTL = 30 * 60 * 1000 // 30 分钟
+
+function getVipSearchCacheKey(line, keyword) {
+  return `vip:line${line}:${keyword.trim()}`
+}
+
+function getVipCachedSearch(line, keyword) {
+  const key = getVipSearchCacheKey(line, keyword)
+  const entry = vipSearchCache.get(key)
+  if (entry && Date.now() - entry.timestamp < VIP_SEARCH_CACHE_TTL) {
+    console.log(`[vip search cache] HIT line${line} "${keyword}"`)
+    return entry.data
+  }
+  return null
+}
+
+function setVipCachedSearch(line, keyword, data) {
+  const key = getVipSearchCacheKey(line, keyword)
+  if (vipSearchCache.size >= VIP_SEARCH_CACHE_MAX) {
+    const entries = [...vipSearchCache.entries()]
+      .sort((a, b) => a[1].timestamp - b[1].timestamp)
+    const toDelete = entries.slice(0, Math.floor(VIP_SEARCH_CACHE_MAX / 2))
+    for (const [k] of toDelete) vipSearchCache.delete(k)
+    console.log(`[vip search cache] 清理 ${toDelete.length} 条过期缓存`)
+  }
+  vipSearchCache.set(key, { data, timestamp: Date.now() })
+  console.log(`[vip search cache] SET line${line} "${keyword}" (${data.length} results)`)
+}
+
+// ==================== ylu.cc Cookie 缓存 ====================
+let yluCookieCache = ''
+let yluCookieExpires = 0
+
+async function getYluCookie() {
+  if (yluCookieCache && Date.now() < yluCookieExpires) {
+    return yluCookieCache
+  }
+  try {
+    const homeResp = await axios.get('https://ylu.cc/', {
+      timeout: 10000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+      },
+      httpsAgent: new https.Agent({ rejectUnauthorized: false })
+    })
+    const setCookie = homeResp.headers['set-cookie']
+    if (setCookie && Array.isArray(setCookie)) {
+      yluCookieCache = setCookie.map(c => c.split(';')[0]).join('; ')
+      yluCookieExpires = Date.now() + 30 * 60 * 1000 // 30 分钟有效
+      console.log(`[ylu cookie] 已缓存:`, yluCookieCache.substring(0, 60) + '...')
+    }
+  } catch (e) {
+    console.warn('[ylu cookie] 获取失败:', e.message)
+  }
+  return yluCookieCache
+}
+
+/**
+ * 通用视频搜索结果解析器（与前端 parseVideoResults 逻辑一致）
+ * 兼容 cloud.nnpp.vip、ylu.cc 及各种中文视频站API返回格式
+ */
+function parseVipVideoResults(data) {
+  const items = []
+
+  // 多种可能的列表路径
+  let list = data?.info || data?.list || data?.data?.list || data?.data || (Array.isArray(data) ? data : [])
+
+  // 顶层分类（如 cloud.nnpp.vip 返回的 {"type":"tv","data":[...]}）
+  const topType = data?.type || ''
+
+  // 如果 list 是对象（如 {0: {...}, 1: {...}}），转为数组
+  if (list && typeof list === 'object' && !Array.isArray(list)) {
+    const vals = Object.values(list).filter(v => v && typeof v === 'object')
+    const looksLikeItems = vals.length > 0 && vals.some(v =>
+      v.vod_name || v.vod_pic || v.title || v.name || v.pic || v.source
+    )
+    if (looksLikeItems) {
+      list = vals
+    }
+  }
+
+  if (!Array.isArray(list)) {
+    return []
+  }
+
+  list.forEach(raw => normalizeItem(raw, topType))
+
+  function normalizeItem(raw, parentType) {
+    if (!raw || typeof raw !== 'object') return
+
+    // === 标题 ===
+    const title = raw.vod_name || raw.title || raw.name || raw.vodName ||
+      raw.vod_title || raw.video_name || raw.videoName || raw.show_name || ''
+
+    // === 图片（优先从 item 自身取，再尝试 source 等嵌套对象） ===
+    const src = raw.source || {}
+    const extra = raw.extra || {}
+    const vodData = raw.vod_data || {}
+    const pic = raw.vod_pic || raw.pic || raw.vodPic || raw.img || raw.image ||
+      raw['img:'] || raw.img_url || raw.vod_img || raw.vod_pic_url || raw.pic_url ||
+      raw.cover || raw.cover_url || raw.poster || raw.thumbnail || raw.thumb || raw.thumb_url ||
+      raw.vod_image_url || raw.vod_cover || raw.vod_thumb ||
+      raw.vod_pic_thumb || raw.pic_thumb || raw.screenshot || raw.logo ||
+      // source 嵌套
+      src.vod_pic || src.pic || src.vodPic || src.img || src.image ||
+      src.cover || src.poster || src.thumbnail || src.vod_pic_url || src.pic_url || src.thumb || src.vod_thumb ||
+      // extra 嵌套
+      extra.vod_pic || extra.pic || extra.cover || extra.thumbnail || extra.thumb || extra.img ||
+      // vod_data 嵌套
+      vodData.vod_pic || vodData.pic || vodData.cover || vodData.thumbnail || vodData.img || ''
+
+    // === 分类/类型 ===
+    const type = raw.type_name || raw.vod_class || raw.type || parentType ||
+      raw.vod_type || raw.vodType || raw.category || raw.vod_category || raw.class_name || ''
+
+    // === 描述 ===
+    const desc = raw.vod_remarks || raw.vod_content || raw.desc || raw.description ||
+      raw.remarks || raw.vod_blurb || raw.content || raw.summary || raw.vod_summary ||
+      (raw.year ? `${raw.year}年` : '') || ''
+
+    // 过滤无效图片值（字符串 "null"、"undefined" 等）
+    const filteredPic = (pic && pic !== 'null' && pic !== 'undefined') ? pic : ''
+
+    // === 播放URL（优先取第一集地址） ===
+    let url = raw.vod_play_url || raw.vodPlayUrl || raw.url || raw.vod_url ||
+      raw.link || raw.href || raw.vod_link || raw.play_url || ''
+
+    // nnpp.vip 格式：从 source.eps 提取第一集
+    if (!url && raw.source?.eps && Array.isArray(raw.source.eps) && raw.source.eps.length > 0) {
+      url = raw.source.eps[0].url || ''
+    }
+
+    // === 额外保存剧集列表（供前端使用） ===
+    const episodes = raw.source?.eps?.map(ep => ({
+      name: ep?.name || ep?.title || '',
+      url: ep?.url || ''
+    })) || []
+
+    if (title) {
+      const item = { title, pic: filteredPic, type, desc, url }
+      if (raw.id) item._sourceId = raw.id // 保留原始 ID（供 ylu.cc 等构造播放页）
+      if (raw.flag !== undefined) item._sourceFlag = raw.flag // 保留 flag（供 ylu.cc 构造播放页 URL）
+      if (raw.flag_name) item._flagName = raw.flag_name
+      if (raw.from) item._from = raw.from
+      if (episodes.length > 0) item.episodes = episodes
+      items.push(item)
+    }
+  }
+
+  return items
+}
+
+// ==================== VIP视频 线路代理搜索 ====================
+
+/**
+ * GET /video-parse/proxy-search/line1
+ * 代理线路一（cloud.nnpp.vip）搜索请求
+ * Query: ?keyword=视频名称
+ * 返回: { code: 0, data: [{title, pic, type, desc, url}, ...] }
+ */
+router.get('/proxy-search/line1', async (req, res, next) => {
+  try {
+    const { keyword } = req.query
+    if (!keyword || !keyword.trim()) {
+      return res.status(400).json({ code: -1, message: '缺少搜索关键词 ?keyword=' })
+    }
+
+    const kw = keyword.trim()
+
+    // 缓存检查
+    const cached = getVipCachedSearch(1, kw)
+    if (cached) {
+      return res.json({ code: 0, data: cached, cached: true })
+    }
+
+    const { z, s1ig } = computeNnppSign()
+    const targetUrl = `https://m1-a1.cloud.nnpp.vip:2223/api/v/?z=${z}&jx=${encodeURIComponent(kw)}&s1ig=${s1ig}`
+
+    console.log(`[proxy line1] 代理请求: "${kw}"`)
+    console.log(`[proxy line1] 目标URL: ${targetUrl}`)
+
+    const response = await axios.get(targetUrl, {
+      timeout: 15000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Referer': 'https://m1-a1.cloud.nnpp.vip/'
+      },
+      httpsAgent: new https.Agent({ rejectUnauthorized: false })
+    })
+
+    const results = parseVipVideoResults(response.data)
+    setVipCachedSearch(1, kw, results)
+
+    console.log(`[proxy line1] 解析完成: ${results.length} 条结果`)
+
+    // 线路1 API 不返回封面图 → 通过豆瓣搜索接口回填封面
+    const needDoubanCover = results.some(r => !r.pic)
+    if (needDoubanCover && results.length > 0) {
+      console.log(`[proxy line1] 无封面图，尝试豆瓣获取封面（共 ${results.length} 条）...`)
+      // 并行搜索前5个结果的豆瓣封面
+      const doubanTasks = results.slice(0, 5).map(async (r, idx) => {
+        try {
+          const dRes = await axios.get('https://movie.douban.com/j/subject_suggest', {
+            params: { q: r.title },
+            timeout: 8000,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+              'Referer': 'https://movie.douban.com/'
+            }
+          })
+          const list = dRes.data || []
+          console.log(`[proxy line1] 豆瓣搜索 "${r.title}" 返回 ${list.length} 条`)
+          if (list.length > 0) {
+            console.log(`[proxy line1]   豆瓣第1条: title="${list[0].title}" img="${(list[0].img || '').substring(0, 80)}"`)
+          }
+          // 找到标题最匹配的条目
+          const best = list.find(item =>
+            item.title === r.title ||
+            (item.title && r.title && (
+              item.title.includes(r.title) || r.title.includes(item.title)
+            ))
+          ) || list[0]
+          if (best && best.img) {
+            // 取原始图片 URL
+            let rawPic = best.img
+            // 豆瓣图片通常尺寸较小，替换为中等尺寸
+            rawPic = rawPic.replace(/\/view\/.*\/public\//, '/view/photo/m/public/').replace(/\/s_ratio_poster\//, '/l_ratio_poster/')
+            // 通过图片代理避免豆瓣防盗链
+            const proxyBase = `/staticTool/api/video-parse/ytdlp/image-proxy`
+            const pic = `${proxyBase}?url=${encodeURIComponent(rawPic)}`
+            console.log(`[proxy line1] 豆瓣封面: "${r.title}" → ${rawPic.substring(0, 80)}`)
+            return { index: idx, pic }
+          } else {
+            console.log(`[proxy line1] 豆瓣未找到匹配封面: "${r.title}" (best.img=${best?.img || '无'})`)
+          }
+        } catch (e) {
+          console.log(`[proxy line1] 豆瓣请求失败 "${r.title}": ${e.message}`)
+        }
+        return null
+      })
+
+      const doubanResults = await Promise.all(doubanTasks)
+      let coverCount = 0
+      for (const dr of doubanResults) {
+        if (dr) {
+          results[dr.index].pic = dr.pic
+          coverCount++
+        }
+      }
+      console.log(`[proxy line1] 豆瓣封面回填完成: ${coverCount}/${doubanResults.length} 条有封面`)
+    }
+
+    if (results.length > 0) {
+      console.log(`[proxy line1] 第一条:`, JSON.stringify(results[0]))
+    }
+
+    res.json({ code: 0, data: results, total: results.length })
+  } catch (err) {
+    console.error('[proxy line1] 代理失败:', err.message)
+    if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
+      return res.status(504).json({ code: -1, message: '线路一搜索超时，请重试' })
+    }
+    if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') {
+      return res.status(502).json({ code: -1, message: '线路一接口暂时不可用' })
+    }
+    next(err)
+  }
+})
+
+/**
+ * GET /video-parse/proxy-search/line2
+ * 代理线路二（ylu.cc）搜索请求（JSONP → JSON 转换）
+ * Query: ?keyword=视频名称
+ * 返回: { code: 0, data: [{title, pic, type, desc, url}, ...] }
+ */
+router.get('/proxy-search/line2', async (req, res, next) => {
+  try {
+    const { keyword } = req.query
+    if (!keyword || !keyword.trim()) {
+      return res.status(400).json({ code: -1, message: '缺少搜索关键词 ?keyword=' })
+    }
+
+    const kw = keyword.trim()
+
+    // 缓存检查
+    const cached = getVipCachedSearch(2, kw)
+    if (cached) {
+      return res.json({ code: 0, data: cached, cached: true })
+    }
+
+    const ts = Date.now()
+    const cbName = `ylu_cb_${ts}`
+    const targetUrl = `https://ylu.cc/api.php?out=jsonp&wd=${encodeURIComponent(kw)}&cb=${cbName}&_=${ts}`
+
+    console.log(`[proxy line2] 代理请求: "${kw}"`)
+    console.log(`[proxy line2] 目标URL: ${targetUrl}`)
+
+    // ylu.cc 需要 cookie 才会返回数据，否则返回"请勿非法调用"
+    const yluCookie = await getYluCookie()
+    console.log(`[proxy line2] ylu.cc cookie:`, yluCookie ? yluCookie.substring(0, 60) + '...' : '(无)')
+
+    const response = await axios.get(targetUrl, {
+      timeout: 15000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Referer': 'https://ylu.cc/',
+        ...(yluCookie ? { Cookie: yluCookie } : {})
+      }
+    })
+
+    // 提取 JSONP 响应中的 JSON 数据
+    let jsonData = null
+    const text = typeof response.data === 'string' ? response.data : JSON.stringify(response.data)
+
+    console.log(`[proxy line2] 原始响应前500字符:`, text.substring(0, 500))
+
+    // 尝试匹配 callback(JSON) 格式
+    const jsonpRegex = new RegExp(`${cbName.replace(/\$/g, '\\$')}\\s*\\(([\\s\\S]*)\\)\\s*;?\\s*$`, 'i')
+    const match = text.match(jsonpRegex)
+    if (match) {
+      try {
+        jsonData = JSON.parse(match[1])
+        console.log(`[proxy line2] JSONP 解析成功，JSON根类型:`, Array.isArray(jsonData) ? 'Array' : typeof jsonData, ', keys:', Object.keys(jsonData || {}).join(', '))
+      } catch (e) {
+        console.error('[proxy line2] JSONP 匹配到但 JSON.parse 失败:', e.message)
+      }
+    } else {
+      console.log('[proxy line2] JSONP 正则未匹配到 cbName')
+    }
+
+    // 回退：尝试直接当 JSON 解析
+    if (!jsonData) {
+      try {
+        jsonData = JSON.parse(text)
+        console.log(`[proxy line2] 直接 JSON 解析成功`)
+      } catch {
+        // 最后尝试宽松提取：去掉 callback 前缀
+        const cleaned = text.replace(/^[^(]*\(/, '').replace(/\)\s*;?\s*$/, '')
+        try {
+          jsonData = JSON.parse(cleaned)
+          console.log(`[proxy line2] 宽松提取 JSON 解析成功`)
+        } catch {
+          console.error('[proxy line2] 无法解析响应:', text.substring(0, 300))
+          return res.json({ code: 0, data: [], total: 0, message: '未找到相关视频' })
+        }
+      }
+    }
+
+    console.log(`[proxy line2] 解析后 JSON 数据:`, JSON.stringify(jsonData).substring(0, 500))
+    let results = parseVipVideoResults(jsonData)
+
+    // ylu.cc 搜索结果没有直接播放URL，构造播放页 URL
+    // 格式: https://ylu.cc/?index{id}-{flag}-1.htm
+    results = results.map(r => {
+      if (!r.url && r._sourceId) {
+        const flag = r._sourceFlag !== undefined ? r._sourceFlag : 3
+        r.url = `https://ylu.cc/?index${r._sourceId}-${flag}-1.htm`
+      }
+      return r
+    })
+
+    console.log(`[proxy line2] 解析结果: ${results.length} 条`)
+
+    // ylu.cc API 不返回封面图 → 通过豆瓣搜索接口回填封面
+    const needDoubanCover = results.some(r => !r.pic)
+    if (needDoubanCover && results.length > 0) {
+      console.log(`[proxy line2] 无封面图，尝试豆瓣获取封面（共 ${results.length} 条）...`)
+      const doubanTasks = results.slice(0, 5).map(async (r, idx) => {
+        try {
+          const dRes = await axios.get('https://movie.douban.com/j/subject_suggest', {
+            params: { q: r.title },
+            timeout: 8000,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+              'Referer': 'https://movie.douban.com/'
+            }
+          })
+          const list = dRes.data || []
+          console.log(`[proxy line2] 豆瓣搜索 "${r.title}" 返回 ${list.length} 条`)
+          if (list.length > 0) {
+            console.log(`[proxy line2]   豆瓣第1条: title="${list[0].title}" img="${(list[0].img || '').substring(0, 80)}"`)
+          }
+          const best = list.find(item =>
+            item.title === r.title ||
+            (item.title && r.title && (
+              item.title.includes(r.title) || r.title.includes(item.title)
+            ))
+          ) || list[0]
+          if (best && best.img) {
+            let rawPic = best.img
+            rawPic = rawPic.replace(/\/view\/.*\/public\//, '/view/photo/m/public/').replace(/\/s_ratio_poster\//, '/l_ratio_poster/')
+            const proxyBase = `/staticTool/api/video-parse/ytdlp/image-proxy`
+            const pic = `${proxyBase}?url=${encodeURIComponent(rawPic)}`
+            console.log(`[proxy line2] 豆瓣封面: "${r.title}" → ${rawPic.substring(0, 80)}`)
+            return { index: idx, pic }
+          }
+        } catch (e) {
+          console.log(`[proxy line2] 豆瓣请求失败 "${r.title}": ${e.message}`)
+        }
+        return null
+      })
+
+      const doubanResults = await Promise.all(doubanTasks)
+      let coverCount = 0
+      for (const dr of doubanResults) {
+        if (dr) {
+          results[dr.index].pic = dr.pic
+          coverCount++
+        }
+      }
+      console.log(`[proxy line2] 豆瓣封面回填完成: ${coverCount}/${doubanTasks.length} 条有封面`)
+    }
+
+    setVipCachedSearch(2, kw, results)
+
+    res.json({ code: 0, data: results, total: results.length })
+  } catch (err) {
+    console.error('[proxy line2] 代理失败:', err.message)
+    if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
+      return res.status(504).json({ code: -1, message: '线路二搜索超时，请重试' })
+    }
+    if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') {
+      return res.status(502).json({ code: -1, message: '线路二接口暂时不可用' })
+    }
+    next(err)
+  }
+})
+
+// ==================== HLS 流代理 ====================
+// 问题：m3u8 内的 .ts 分片来自 CDN（如 c.baisiweiting.com:18443），浏览器端因 SSL/CORS 无法直接加载
+// 方案：后端代理整个 HLS 流，重写 m3u8 中的分片 URL，使所有请求走后端
+
+/**
+ * GET /video-parse/hls-proxy?url=<encoded_m3u8_url>
+ * 代理 m3u8 播放列表，将所有分片 URL 重写为走本后端代理
+ */
+router.get('/hls-proxy', async (req, res, next) => {
+  try {
+    const { url } = req.query
+    if (!url) {
+      return res.status(400).json({ code: -1, message: '缺少 m3u8 地址参数 ?url=' })
+    }
+
+    console.log(`[hls-proxy] 获取 m3u8: ${url.substring(0, 120)}...`)
+
+    const targetUrl = new URL(url)
+
+    const response = await axios.get(url, {
+      timeout: 15000,
+      responseType: 'text',
+      maxRedirects: 5,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Referer': targetUrl.origin + '/',
+        'Origin': targetUrl.origin,
+        // 模拟正常浏览器请求的 sec-fetch 头
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'cross-site',
+        'Sec-Fetch-Dest': 'empty',
+        'Connection': 'keep-alive'
+      },
+      httpsAgent: new https.Agent({ rejectUnauthorized: false })
+    })
+
+    let m3u8Content = response.data
+
+    // 检测是否返回了 HTML 页面（如 CloudFlare 拦截页、反爬验证页）
+    if (typeof m3u8Content === 'string' && (m3u8Content.trim().startsWith('<!') || m3u8Content.trim().startsWith('<html'))) {
+      console.error('[hls-proxy] 源站返回 HTML 拦截页，非 m3u8 内容（前200字符）:', m3u8Content.substring(0, 200))
+      return res.status(502).json({
+        code: -1,
+        message: '视频源站开启了反爬保护（CloudFlare/验证页），无法获取播放列表。请尝试切换播放线路或使用外部播放。'
+      })
+    }
+
+    // 代理端点使用完整绝对 URL，避免 hls.js 相对路径解析歧义
+    const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https'
+    const host = req.get('host') || 'wellwin.top'
+    const origin = `${proto}://${host}`
+    const segProxyBase = `${origin}/staticTool/api/video-parse/hls-segment?url=`
+
+    /**
+     * 使用标准 URL 构造函数将 uri 转为源站绝对地址
+     */
+    function resolveAbsUrl(uri) {
+      try {
+        return new URL(uri, targetUrl).href
+      } catch {
+        return uri
+      }
+    }
+
+    // 重写 m3u8 中的所有资源 URL 为代理 URL
+    const lines = m3u8Content.split('\n')
+    const rewritten = lines.map(line => {
+      const trimmed = line.trim()
+
+      // 重写 EXT-X-KEY URI（加密密钥）
+      if (trimmed.startsWith('#EXT-X-KEY') && trimmed.includes('URI=')) {
+        return trimmed.replace(/URI="([^"]+)"/g, (match, uri) => {
+          return `URI="${segProxyBase}${encodeURIComponent(resolveAbsUrl(uri))}"`
+        }).replace(/URI=(?!")/g, () => {
+          // 无引号的 URI 格式: URI=key.key
+          const rest = trimmed.substring(trimmed.indexOf('URI=') + 4)
+          const uri = rest.split(',')[0].trim()
+          if (!uri || uri.startsWith('"')) return `URI="${segProxyBase}${encodeURIComponent(resolveAbsUrl(uri))}"`
+          return `URI="${segProxyBase}${encodeURIComponent(resolveAbsUrl(uri))}"`
+        })
+      }
+
+      // 重写 EXT-X-MAP URI（fmp4 初始化段）
+      if (trimmed.startsWith('#EXT-X-MAP') && trimmed.includes('URI=')) {
+        return trimmed.replace(/URI="([^"]+)"/g, (match, uri) => {
+          return `URI="${segProxyBase}${encodeURIComponent(resolveAbsUrl(uri))}"`
+        })
+      }
+
+      // 跳过其他注释行、空行
+      if (!trimmed || trimmed.startsWith('#')) return line
+
+      // 重写资源 URL（.ts / .m3u8）
+      const absoluteUrl = resolveAbsUrl(trimmed)
+      return `${segProxyBase}${encodeURIComponent(absoluteUrl)}`
+    })
+
+    m3u8Content = rewritten.join('\n')
+
+    res.set({
+      'Content-Type': 'application/vnd.apple.mpegurl',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-cache'
+    })
+    res.send(m3u8Content)
+  } catch (err) {
+    console.error('[hls-proxy] 失败:', err.message, err.code)
+    // 详细的错误信息
+    if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
+      return res.status(504).json({ code: -1, message: '获取 m3u8 超时，视频源站无响应' })
+    }
+    if (err.code === 'ENOTFOUND' || err.code === 'EAI_AGAIN') {
+      return res.status(502).json({ code: -1, message: '视频源站域名解析失败，可能已下线' })
+    }
+    if (err.code === 'ECONNREFUSED') {
+      return res.status(502).json({ code: -1, message: '视频源站拒绝连接' })
+    }
+    if (err.response?.status === 403) {
+      return res.status(502).json({ code: -1, message: '视频源站拒绝访问（403），可能开启了防盗链' })
+    }
+    if (err.response?.status === 404) {
+      return res.status(502).json({ code: -1, message: '视频链接已失效（404）' })
+    }
+    if (err.response?.status) {
+      return res.status(502).json({ code: -1, message: `视频源站返回 ${err.response.status} 错误` })
+    }
+    next(err)
+  }
+})
+
+/**
+ * GET /video-parse/proxy-page?url=<encoded_page_url>
+ * 代理外部页面（用于 iframe 内嵌），自动剥离 X-Frame-Options / CSP frame-ancestors
+ * 解决 ylu.cc 等站点禁止 iframe 嵌入导致的移动端黑屏问题
+ */
+router.get('/proxy-page', async (req, res, next) => {
+  try {
+    const { url } = req.query
+    if (!url) return res.status(400).json({ code: -1, message: '缺少 url 参数' })
+
+    const response = await axios.get(url, {
+      timeout: 20000,
+      responseType: 'text',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Referer': new URL(url).origin + '/'
+      },
+      httpsAgent: insecureAgent,
+      maxRedirects: 5
+    })
+
+    let html = response.data
+    // 注入 <base> 标签以修复相对路径（CSS/JS/图片等从源站加载）
+    const baseOrigin = new URL(url).origin
+    if (!/<base\s/i.test(html)) {
+      html = html.replace(/<head[^>]*>/i, `$&\n<base href="${baseOrigin}/">`)
+    }
+
+    res.set({
+      'Content-Type': 'text/html; charset=utf-8',
+      'Access-Control-Allow-Origin': '*',
+      // 明确不设置 X-Frame-Options，允许被任意 iframe 嵌入
+      'X-Frame-Options': '',
+      'Cache-Control': 'no-cache'
+    })
+    // 移除可能存在的 X-Frame-Options（某些库会自动添加）
+    res.removeHeader('X-Frame-Options')
+    res.send(html)
+  } catch (err) {
+    console.error('[proxy-page] 代理失败:', err.message)
+    if (!res.headersSent) {
+      res.setHeader('Access-Control-Allow-Origin', '*')
+      res.status(502).json({ code: -1, message: '页面代理失败: ' + err.message })
+    }
+  }
+})
+
+/**
+ * GET /video-parse/hls-segment?url=<encoded_ts_url>
+ * 代理 .ts 分片数据
+ */
+router.get('/hls-segment', async (req, res, next) => {
+  try {
+    const { url } = req.query
+    if (!url) {
+      return res.status(400).end()
+    }
+
+    const targetUrl = new URL(url)
+
+    const response = await axios.get(url, {
+      timeout: 30000,
+      responseType: 'stream',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Referer': targetUrl.origin + '/',
+        'Origin': targetUrl.origin,
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'cross-site',
+        'Sec-Fetch-Dest': 'empty'
+      },
+      httpsAgent: new https.Agent({ rejectUnauthorized: false })
+    })
+
+    res.set({
+      'Content-Type': response.headers['content-type'] || 'video/mp2t',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'public, max-age=3600',
+      'Content-Length': response.headers['content-length'] || ''
+    })
+
+    response.data.pipe(res)
+  } catch (err) {
+    console.error('[hls-segment] 代理分片失败:', err.message)
+    // 分片偶发失败不中断整个流，返回 502 让 hls.js 重试
+    if (!res.headersSent) {
+      res.setHeader('Access-Control-Allow-Origin', '*')
+      res.status(502).end()
+    }
+  }
+})
 
 // ==================== 路由 ====================
 
@@ -1405,12 +2091,12 @@ router.post('/ytdlp/playlist', async (req, res, next) => {
 
 /**
  * GET /video-parse/ytdlp/image-proxy
- * 代理B站图片，解决403防盗链问题
- * Query: ?url=encodeURIComponent(原图URL)
+ * 代理外部图片，解决防盗链问题
+ * Query: ?url=encodeURIComponent(原图URL)&ref=encodeURIComponent(Referer)
  */
 router.get('/ytdlp/image-proxy', async (req, res) => {
   try {
-    const { url } = req.query
+    const { url, ref } = req.query
     if (!url) return res.status(400).json({ code: -1, message: '缺少 url 参数' })
 
     const proxyUrl = decodeURIComponent(url)
@@ -1419,10 +2105,20 @@ router.get('/ytdlp/image-proxy', async (req, res) => {
       return res.status(400).json({ code: -1, message: '不支持的 URL 协议' })
     }
 
+    // 根据图片域名自动选择 Referer
+    let referer = 'https://www.bilibili.com/'
+    if (ref) {
+      referer = decodeURIComponent(ref)
+    } else if (proxyUrl.includes('douban')) {
+      referer = 'https://movie.douban.com/'
+    } else if (proxyUrl.includes('doubanio.com')) {
+      referer = 'https://movie.douban.com/'
+    }
+
     const response = await axios.get(proxyUrl, {
       responseType: 'arraybuffer',
       headers: {
-        'Referer': 'https://www.bilibili.com/',
+        'Referer': referer,
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
       },
       timeout: 10000
@@ -1517,6 +2213,498 @@ router.get('/ytdlp/lyrics', async (req, res) => {
     console.error('[lyrics] 搜索失败:', e.message)
     // 降级：返回空结果而不是报错
     res.json({ code: 0, data: { syncedLyrics: '', plainLyrics: '', message: '歌词服务暂不可用' } })
+  }
+})
+
+// ==================== 页面代理（绕过 X-Frame-Options） ====================
+/**
+ * GET /video-parse/proxy-page?url=<encoded_url>
+ * 代理第三方页面，移除 X-Frame-Options 等禁止内嵌的头，支持在 iframe 中播放
+ * 用于 ylu.cc 等网站的视频播放页内嵌
+ */
+router.get('/proxy-page', async (req, res, next) => {
+  try {
+    let { url } = req.query
+    if (!url) {
+      return res.status(400).json({ code: -1, message: '缺少页面地址 ?url=' })
+    }
+
+    // 兼容被双重编码的 URL（前端可能已编码一次，浏览器再编码一次）
+    try {
+      url = decodeURIComponent(url)
+    } catch {}
+
+    console.log(`[proxy-page] 代理页面: ${url.substring(0, 150)}`)
+
+    const targetUrl = new URL(url)
+    const isYluCc = targetUrl.hostname.includes('ylu.cc')
+
+    // ylu.cc 需要 cookie
+    const extraHeaders = {}
+    if (isYluCc) {
+      const yluCookie = await getYluCookie()
+      if (yluCookie) {
+        extraHeaders.Cookie = yluCookie
+      }
+    }
+
+    const response = await axios.get(url, {
+      timeout: 20000,
+      responseType: 'text',
+      maxRedirects: 5,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Referer': targetUrl.origin + '/',
+        'Origin': targetUrl.origin,
+        ...extraHeaders
+      },
+      httpsAgent: new https.Agent({ rejectUnauthorized: false })
+    })
+
+    let html = typeof response.data === 'string' ? response.data : JSON.stringify(response.data)
+
+    console.log(`[proxy-page] 响应长度: ${html.length}, 前200字符:`, html.substring(0, 200))
+
+    // 检测 ylu.cc 反爬提示
+    if (isYluCc && html.includes('请勿非法调用')) {
+      console.warn('[proxy-page] ylu.cc 返回反爬提示，清除 cookie 缓存重试一次')
+      yluCookieCache = ''
+      yluCookieExpires = 0
+      const newCookie = await getYluCookie()
+      if (newCookie) {
+        // 重试
+        const retryResp = await axios.get(url, {
+          timeout: 20000,
+          responseType: 'text',
+          maxRedirects: 5,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Referer': targetUrl.origin + '/',
+            'Origin': targetUrl.origin,
+            Cookie: newCookie
+          },
+          httpsAgent: new https.Agent({ rejectUnauthorized: false })
+        })
+        html = typeof retryResp.data === 'string' ? retryResp.data : JSON.stringify(retryResp.data)
+      }
+    }
+
+    // 注入 <base> 标签，确保相对路径资源正确加载
+    html = html.replace(/<head[^>]*>/i, match => {
+      return match + `\n<base href="${targetUrl.origin}/">`
+    })
+
+    res.setHeader('Content-Type', 'text/html; charset=utf-8')
+    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate')
+    // 不设置 X-Frame-Options，允许 iframe 内嵌
+    res.removeHeader('X-Frame-Options')
+    res.send(html)
+  } catch (err) {
+    console.error('[proxy-page] 代理失败:', err.message)
+    if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
+      return res.status(504).json({ code: -1, message: '页面加载超时，请重试' })
+    }
+    next(err)
+  }
+})
+
+// ==================== VIP视频 线路五（tv.chen-dong.com）代理 ====================
+
+/**
+ * GET /video-parse/proxy-search/line5
+ * 代理线路五（tv.chen-dong.com）搜索请求
+ * Query: ?keyword=视频名称
+ * 返回: { code: 0, data: [{title, pic, type, desc, _sourceId, _sourceFlag, _flagName, _from}, ...] }
+ * 注意：搜索结果不含播放URL，需通过 /video-parse/cd-play 端点解析播放地址
+ */
+router.get('/proxy-search/line5', async (req, res, next) => {
+  try {
+    const { keyword } = req.query
+    if (!keyword || !keyword.trim()) {
+      return res.status(400).json({ code: -1, message: '缺少搜索关键词 ?keyword=' })
+    }
+
+    const kw = keyword.trim()
+
+    // 缓存检查
+    const cached = getVipCachedSearch(5, kw)
+    if (cached) {
+      return res.json({ code: 0, data: cached, cached: true })
+    }
+
+    const ts = Date.now()
+    const cbName = `cd_cb_${ts}`
+    const targetUrl = `https://tv.chen-dong.com/api.php?out=jsonp&wd=${encodeURIComponent(kw)}&cb=${cbName}&_=${ts}`
+
+    console.log(`[proxy line5] 代理请求: "${kw}"`)
+    console.log(`[proxy line5] 目标URL: ${targetUrl}`)
+
+    const response = await axios.get(targetUrl, {
+      timeout: 15000,
+      httpsAgent: insecureAgent,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Referer': 'https://tv.chen-dong.com/',
+        'Origin': 'https://tv.chen-dong.com'
+      }
+    })
+
+    // 提取 JSONP 响应中的 JSON 数据
+    let jsonData = null
+    const text = typeof response.data === 'string' ? response.data : JSON.stringify(response.data)
+
+    console.log(`[proxy line5] 原始响应前500字符:`, text.substring(0, 500))
+
+    // 尝试匹配 callback(JSON) 格式
+    const jsonpRegex = new RegExp(cbName.replace(/\$/g, '\\$') + '\\s*\\(([\\s\\S]*)\\)\\s*;?\\s*$', 'i')
+    const match = text.match(jsonpRegex)
+    if (match) {
+      try {
+        jsonData = JSON.parse(match[1])
+        console.log(`[proxy line5] JSONP 解析成功`)
+      } catch (e) {
+        console.error('[proxy line5] JSONP 匹配到但 JSON.parse 失败:', e.message)
+      }
+    }
+
+    // 回退：尝试直接当 JSON 解析
+    if (!jsonData) {
+      try {
+        jsonData = JSON.parse(text)
+        console.log(`[proxy line5] 直接 JSON 解析成功`)
+      } catch {
+        console.error('[proxy line5] 无法解析响应:', text.substring(0, 300))
+        return res.json({ code: 0, data: [], total: 0, message: '线路五搜索无结果' })
+      }
+    }
+
+    let results = parseVipVideoResults(jsonData)
+    console.log(`[proxy line5] 解析结果: ${results.length} 条`)
+
+    // chen-dong API 结果：优先使用接口返回的封面图（通过 image-proxy 代理，避免防盗链）
+    const IMG_PROXY = `/staticTool/api/video-parse/ytdlp/image-proxy`
+    let directCoverCount = 0
+    for (const r of results) {
+      if (r.pic && /^https?:\/\//i.test(r.pic)) {
+        console.log(`[proxy line5] 接口自带封面: "${r.title}" → ${r.pic.substring(0, 80)}`)
+        r.pic = `${IMG_PROXY}?url=${encodeURIComponent(r.pic)}`
+        directCoverCount++
+      }
+    }
+    if (directCoverCount > 0) {
+      console.log(`[proxy line5] 接口自带封面使用: ${directCoverCount}/${results.length} 条`)
+    }
+
+    // 仅对仍无封面的结果 → 通过豆瓣搜索接口回填封面
+    const needDoubanCover = results.some(r => !r.pic)
+    if (needDoubanCover && results.length > 0) {
+      console.log(`[proxy line5] 无封面图，尝试豆瓣获取封面（共 ${results.length} 条）...`)
+      // 辅助：去空格/统一大小写，提升标题匹配准确度
+      const normTitle = t => String(t || '').replace(/\s+/g, '').toLowerCase()
+      const doubanTasks = results.map(async (r, idx) => {
+        try {
+          const dRes = await axios.get('https://movie.douban.com/j/subject_suggest', {
+            params: { q: r.title },
+            timeout: 8000,
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+              'Referer': 'https://movie.douban.com/'
+            }
+          })
+          const list = dRes.data || []
+          if (list.length === 0) return { index: idx, pic: '' }
+          const rn = normTitle(r.title)
+          const best = list.find(item => {
+            const tn = normTitle(item.title)
+            return tn === rn || (tn && rn && (tn.includes(rn) || rn.includes(tn)))
+          }) || list[0]
+          if (best && best.img && best.img !== 'null' && best.img !== 'undefined') {
+            let rawPic = best.img
+            rawPic = rawPic.replace(/\/view\/.*\/public\//, '/view/photo/m/public/').replace(/\/s_ratio_poster\//, '/l_ratio_poster/')
+            const proxyBase = `/staticTool/api/video-parse/ytdlp/image-proxy`
+            return { index: idx, pic: `${proxyBase}?url=${encodeURIComponent(rawPic)}` }
+          }
+          return { index: idx, pic: '' }
+        } catch (e) {
+          console.log(`[proxy line5] 豆瓣回填失败 "${r.title}": ${e.message}`)
+          return { index: idx, pic: '' }
+        }
+      })
+      const doubanResults = await Promise.all(doubanTasks)
+      let coverCount = 0
+      for (const dr of doubanResults) {
+        if (dr && dr.pic) {
+          results[dr.index].pic = dr.pic
+          coverCount++
+        }
+      }
+      console.log(`[proxy line5] 豆瓣封面回填完成: ${coverCount}/${doubanResults.length} 条有封面`)
+    }
+
+    setVipCachedSearch(5, kw, results)
+
+    res.json({ code: 0, data: results, total: results.length })
+  } catch (err) {
+    console.error('[proxy line5] 代理失败:', err.message)
+    if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
+      return res.status(504).json({ code: -1, message: '线路五搜索超时，请重试' })
+    }
+    if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') {
+      return res.status(502).json({ code: -1, message: '线路五接口暂时不可用' })
+    }
+    next(err)
+  }
+})
+
+/**
+ * GET /video-parse/cd-play?id=88295&flag=0
+ * 解析线路五（tv.chen-dong.com）视频的播放地址
+ * 返回: { code, data: { url, title, pic, episodes: [{name, url}] } }
+ * 
+ * chen-dong 播放API返回JSONP格式:
+ * { success, code, url: "m3u8地址", pic, title, info: [{video: ["第01集$url$", ...]}] }
+ */
+router.get('/cd-play', async (req, res, next) => {
+  try {
+    const { id, flag } = req.query
+    if (!id || flag === undefined) {
+      return res.status(400).json({ code: -1, message: '缺少参数 ?id=视频ID&flag=线路标识' })
+    }
+
+    const ts = Date.now()
+    const cbName = `cd_play_${ts}`
+    const targetUrl = `https://tv.chen-dong.com/api.php?out=jsonp&flag=${flag}&id=${id}&cb=${cbName}&_=${ts}`
+
+    console.log(`[cd-play] 解析播放地址: id=${id}, flag=${flag}`)
+
+    const response = await axios.get(targetUrl, {
+      timeout: 15000,
+      httpsAgent: insecureAgent,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Referer': 'https://tv.chen-dong.com/',
+        'Origin': 'https://tv.chen-dong.com'
+      }
+    })
+
+    const text = typeof response.data === 'string' ? response.data : JSON.stringify(response.data)
+
+    // 提取 JSONP
+    let jsonData = null
+    const jsonpRegex = new RegExp(cbName.replace(/\$/g, '\\$') + '\\s*\\(([\\s\\S]*)\\)\\s*;?\\s*$', 'i')
+    const match = text.match(jsonpRegex)
+    if (match) {
+      try {
+        jsonData = JSON.parse(match[1])
+      } catch { /* fallback below */ }
+    }
+    if (!jsonData) {
+      try { jsonData = JSON.parse(text) } catch {
+        console.error('[cd-play] 无法解析响应:', text.substring(0, 300))
+        return res.status(502).json({ code: -1, message: '线路五解析失败，无法获取播放地址' })
+      }
+    }
+
+    if (!jsonData.success || !jsonData.url) {
+      console.error('[cd-play] API 返回异常:', JSON.stringify(jsonData).substring(0, 300))
+      return res.status(502).json({ code: -1, message: '线路五解析失败，该资源暂无播放地址' })
+    }
+
+    // 提取播放列表
+    const m3u8Url = jsonData.url
+    const title = jsonData.title || ''
+    const pic = jsonData.pic || ''
+
+    // 解析剧集列表: "第01集$https://...index.m3u8$"
+    const episodes = []
+    if (jsonData.info && Array.isArray(jsonData.info)) {
+      for (const info of jsonData.info) {
+        if (info.video && Array.isArray(info.video)) {
+          for (const item of info.video) {
+            // 格式: "第01集$https://vod1.maowushi.com/.../index.m3u8$"
+            const parts = item.split('$')
+            if (parts.length >= 2) {
+              episodes.push({
+                name: parts[0] || `第${episodes.length + 1}集`,
+                url: parts[1]
+              })
+            }
+          }
+        }
+      }
+    }
+
+    console.log(`[cd-play] 解析完成: "${title}", ${episodes.length} 集, m3u8=${m3u8Url.substring(0, 80)}...`)
+
+    res.json({
+      code: 0,
+      data: {
+        url: m3u8Url,
+        title,
+        pic,
+        episodes
+      }
+    })
+  } catch (err) {
+    console.error('[cd-play] 代理失败:', err.message)
+    if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
+      return res.status(504).json({ code: -1, message: '线路五播放解析超时，请重试' })
+    }
+    next(err)
+  }
+})
+
+// ==================== HLS 流转发代理 ====================
+
+/**
+ * GET /video-parse/hls-proxy
+ * 代理 HLS 子播放列表（m3u8），重写内部所有资源 URL 再次走本代理
+ * Query: ?url=encodeURIComponent(原始m3u8地址)
+ */
+router.get('/hls-proxy', async (req, res) => {
+  try {
+    const { url } = req.query
+    if (!url) {
+      return res.status(400).json({ code: -1, message: '缺少 url 参数' })
+    }
+
+    const targetUrl = decodeURIComponent(url)
+    if (!/^https?:\/\//i.test(targetUrl)) {
+      return res.status(400).json({ code: -1, message: '不支持的 URL 协议' })
+    }
+
+    console.log(`[hls-proxy] 代理 m3u8: ${targetUrl.substring(0, 100)}`)
+
+    const response = await axios.get(targetUrl, {
+      responseType: 'text',
+      timeout: 15000,
+      maxRedirects: 5,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Referer': new URL(targetUrl).origin + '/',
+        'Origin': new URL(targetUrl).origin
+      },
+      httpsAgent: insecureAgent
+    })
+
+    let m3u8Content = response.data
+    if (typeof m3u8Content !== 'string') {
+      m3u8Content = String(m3u8Content)
+    }
+
+    // 构造代理 URL（使用完整绝对 URL，避免 hls.js 相对路径解析歧义）
+    const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https'
+    const host = req.get('host') || 'wellwin.top'
+    const origin = `${proto}://${host}`
+    const segProxyBase = `${origin}/staticTool/api/video-parse/hls-segment?url=`
+    const playlistProxyBase = `${origin}/staticTool/api/video-parse/hls-proxy?url=`
+
+    function resolveAbsUrl(uri) {
+      try {
+        return new URL(uri, targetUrl).href
+      } catch {
+        return uri
+      }
+    }
+
+    const lines = m3u8Content.split('\n')
+    const rewritten = lines.map(line => {
+      const trimmed = line.trim()
+
+      // EXT-X-KEY:重写密钥 URI
+      if (trimmed.startsWith('#EXT-X-KEY') && trimmed.includes('URI=')) {
+        return trimmed.replace(/URI="([^"]+)"/g, (match, uri) => {
+          return `URI="${segProxyBase}${encodeURIComponent(resolveAbsUrl(uri))}"`
+        }).replace(/URI=(?!")/g, (match) => {
+          const rest = trimmed.substring(trimmed.indexOf('URI=') + 4)
+          const uri = rest.split(',')[0].trim()
+          if (!uri || uri.startsWith('"')) return match
+          return `URI="${segProxyBase}${encodeURIComponent(resolveAbsUrl(uri))}"`
+        })
+      }
+
+      // EXT-X-MAP:重写 fmp4 初始化段 URI
+      if (trimmed.startsWith('#EXT-X-MAP') && trimmed.includes('URI=')) {
+        return trimmed.replace(/URI="([^"]+)"/g, (match, uri) => {
+          return `URI="${segProxyBase}${encodeURIComponent(resolveAbsUrl(uri))}"`
+        })
+      }
+
+      if (!trimmed || trimmed.startsWith('#')) return line
+
+      const absoluteUrl = resolveAbsUrl(trimmed)
+      const isPlaylist = /\.m3u8(\?|$)/i.test(absoluteUrl)
+      const proxyBase = isPlaylist ? playlistProxyBase : segProxyBase
+      return `${proxyBase}${encodeURIComponent(absoluteUrl)}`
+    })
+
+    res.set({
+      'Content-Type': 'application/vnd.apple.mpegurl',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-cache'
+    })
+    res.send(rewritten.join('\n'))
+  } catch (err) {
+    console.error('[hls-proxy] 代理失败:', err.message)
+    if (!res.headersSent) {
+      res.status(502).json({ code: -1, message: 'HLS 代理失败: ' + err.message })
+    }
+  }
+})
+
+/**
+ * GET /video-parse/hls-segment
+ * 代理 HLS 分片（.ts / .m4s / .key 等二进制资源）
+ * Query: ?url=encodeURIComponent(原始分片URL)
+ */
+router.get('/hls-segment', async (req, res) => {
+  try {
+    const { url } = req.query
+    if (!url) {
+      return res.status(400).json({ code: -1, message: '缺少 url 参数' })
+    }
+
+    const targetUrl = decodeURIComponent(url)
+    if (!/^https?:\/\//i.test(targetUrl)) {
+      return res.status(400).json({ code: -1, message: '不支持的 URL 协议' })
+    }
+
+    const response = await axios.get(targetUrl, {
+      responseType: 'stream',
+      timeout: 30000,
+      maxRedirects: 5,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Referer': new URL(targetUrl).origin + '/',
+        'Origin': new URL(targetUrl).origin
+      },
+      httpsAgent: insecureAgent
+    })
+
+    const ct = response.headers['content-type'] || 'video/mp2t'
+    res.set({
+      'Content-Type': ct,
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'public, max-age=3600',
+      'Accept-Ranges': 'bytes'
+    })
+    response.data.pipe(res)
+  } catch (err) {
+    console.error('[hls-segment] 代理失败:', err.message)
+    if (!res.headersSent) {
+      res.setHeader('Access-Control-Allow-Origin', '*')
+      res.status(502).json({ code: -1, message: '分片代理失败: ' + err.message })
+    }
   }
 })
 

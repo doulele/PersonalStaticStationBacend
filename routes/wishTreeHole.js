@@ -25,8 +25,14 @@ const ANIMAL_MASKS = [
   '树洞蝶', '树洞鱼', '树洞鹊', '树洞蛙', '树洞蝉'
 ]
 
-function randomMask() {
-  return ANIMAL_MASKS[Math.floor(Math.random() * ANIMAL_MASKS.length)]
+// 基于 userId 的确定性马甲（同一用户始终同一马甲）
+function userMask(userId) {
+  let hash = 0
+  for (let i = 0; i < userId.length; i++) {
+    hash = ((hash << 5) - hash) + userId.charCodeAt(i)
+    hash |= 0
+  }
+  return ANIMAL_MASKS[Math.abs(hash) % ANIMAL_MASKS.length]
 }
 
 // ==================== 家庭信息（共享空间，只读） ====================
@@ -153,16 +159,17 @@ router.post('/wishes', authRequired, (req, res) => {
     const userId = req.userId
     const familyId = getFamilyId(userId)
     if (!familyId) return res.json({ success: false, error: '请先加入家庭' })
-    const { title, description, category, priority, targetDate, subTasks, mediaLinks } = req.body
+    const { title, description, category, priority, targetDate, targetCount, subTasks, mediaLinks } = req.body
     if (!title || !title.trim()) return res.json({ success: false, error: '愿望标题不能为空' })
     const id = uid('w')
     const now = nowISO()
+    const tc = Math.max(1, Math.min(Number(targetCount) || 5, 99))
     dbRun(
-      `INSERT INTO wishes (id, familyId, userId, title, description, category, priority, status, progress, targetDate, createdAt, updatedAt, mediaLinks, subTasks, isShared)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [id, familyId, userId, title.trim(), description || '', category || '生活', priority || '中', '进行中', 0, targetDate || null, now, now, JSON.stringify(mediaLinks || []), JSON.stringify(subTasks || []), 1]
+      `INSERT INTO wishes (id, familyId, userId, title, description, category, priority, status, progress, targetCount, targetDate, createdAt, updatedAt, mediaLinks, subTasks, isShared)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      [id, familyId, userId, title.trim(), description || '', category || '生活', priority || '中', '进行中', 0, tc, targetDate || null, now, now, JSON.stringify(mediaLinks || []), JSON.stringify(subTasks || []), 1]
     )
-    res.json({ success: true, data: { id, title: title.trim(), status: '进行中', progress: 0, createdAt: now } })
+    res.json({ success: true, data: { id, title: title.trim(), status: '进行中', progress: 0, targetCount: tc, createdAt: now } })
   } catch (e) {
     res.json({ success: false, error: e.message })
   }
@@ -173,7 +180,7 @@ router.put('/wishes/:id', authRequired, (req, res) => {
   try {
     const wish = dbGet('SELECT * FROM wishes WHERE id = ?', [req.params.id])
     if (!wish) return res.json({ success: false, error: '愿望不存在' })
-    const allowed = ['title', 'description', 'category', 'priority', 'targetDate', 'status', 'progress', 'isShared', 'mediaLinks', 'subTasks']
+    const allowed = ['title', 'description', 'category', 'priority', 'targetDate', 'status', 'progress', 'targetCount', 'isShared', 'mediaLinks', 'subTasks']
     const updates = []
     const params = []
     for (const key of allowed) {
@@ -231,13 +238,22 @@ router.post('/wishes/:id/checkin', authRequired, (req, res) => {
     const { note, progress } = req.body
     const wish = dbGet('SELECT * FROM wishes WHERE id = ?', [req.params.id])
     if (!wish) return res.json({ success: false, error: '愿望不存在' })
+
+    // 计算当前打卡次数
+    const checkinCount = dbGet('SELECT COUNT(*) as cnt FROM wish_checkins WHERE wishId = ?', [req.params.id])
+    const currentCount = checkinCount ? checkinCount.cnt : 0
+    const newCount = currentCount + 1
+
+    // 基于 targetCount 计算进度
+    const targetCount = wish.targetCount || 5
+    const newProgress = progress ?? Math.min(Math.round((newCount / targetCount) * 100), 100)
+
     const checkinId = uid('ci')
     dbRun(
       'INSERT INTO wish_checkins (id, wishId, userId, note, progress, createdAt) VALUES (?,?,?,?,?,?)',
-      [checkinId, req.params.id, req.userId, note || '', progress ?? wish.progress, nowISO()]
+      [checkinId, req.params.id, req.userId, note || '', newProgress, nowISO()]
     )
     // 更新主进度
-    const newProgress = progress ?? Math.min(wish.progress + 10, 100)
     let newStatus = wish.status
     if (newProgress >= 100) newStatus = '已完成'
     dbRun('UPDATE wishes SET progress = ?, status = ?, updatedAt = ? WHERE id = ?', [newProgress, newStatus, nowISO(), req.params.id])
@@ -321,7 +337,7 @@ router.post('/moods', authRequired, (req, res) => {
     const { content, isAnonymous = true, wishId, moodWeather } = req.body
     if (!content || !content.trim()) return res.json({ success: false, error: '内容不能为空' })
     const id = uid('mo')
-    const animalMask = isAnonymous ? randomMask() : ''
+    const animalMask = isAnonymous ? userMask(userId) : ''
     const now = nowISO()
 
     // SOS检测：极度负面词汇
@@ -382,6 +398,75 @@ router.post('/moods/:id/convert', authRequired, (req, res) => {
   }
 })
 
+// ==================== 树洞评论 ====================
+
+/** 获取树洞评论列表 */
+router.get('/moods/:id/comments', authRequired, (req, res) => {
+  try {
+    const comments = dbAll(
+      `SELECT c.*, u.nickname as creatorName
+       FROM mood_comments c
+       LEFT JOIN users u ON c.userId = u.userId
+       WHERE c.moodId = ?
+       ORDER BY c.createdAt ASC`,
+      [req.params.id]
+    )
+    const result = comments.map(c => ({
+      ...c,
+      isMine: c.userId === req.userId
+    }))
+    res.json({ success: true, data: result })
+  } catch (e) {
+    res.json({ success: false, error: e.message })
+  }
+})
+
+/** 发表评论 */
+router.post('/moods/:id/comments', authRequired, (req, res) => {
+  try {
+    const userId = req.userId
+    const { content, isAnonymous = true } = req.body
+    if (!content || !content.trim()) return res.json({ success: false, error: '评论内容不能为空' })
+
+    const mood = dbGet('SELECT * FROM moods WHERE id = ?', [req.params.id])
+    if (!mood) return res.json({ success: false, error: '树洞不存在' })
+
+    const id = uid('mc')
+    const animalMask = isAnonymous ? userMask(userId) : ''
+    const now = nowISO()
+
+    dbRun(
+      'INSERT INTO mood_comments (id, moodId, userId, content, isAnonymous, animalMask, createdAt) VALUES (?,?,?,?,?,?,?)',
+      [id, req.params.id, userId, content.trim(), isAnonymous ? 1 : 0, animalMask, now]
+    )
+
+    // 通知树洞作者（非本人评论时）
+    if (mood.userId !== userId) {
+      const commenterName = isAnonymous ? animalMask : (req.user?.nickname || '有人')
+      dbRun(
+        'INSERT INTO notifications (id, userId, type, title, content, relatedId, createdAt) VALUES (?,?,?,?,?,?,?)',
+        [uid('n'), mood.userId, 'comment', '💬 有人评论了你的树洞', `${commenterName}：${content.trim().slice(0, 50)}`, req.params.id, now]
+      )
+    }
+
+    res.json({ success: true, data: { id, content: content.trim(), isAnonymous: !!isAnonymous, animalMask, createdAt: now } })
+  } catch (e) {
+    res.json({ success: false, error: e.message })
+  }
+})
+
+/** 删除评论 */
+router.delete('/comments/:id', authRequired, (req, res) => {
+  try {
+    const comment = dbGet('SELECT * FROM mood_comments WHERE id = ? AND userId = ?', [req.params.id, req.userId])
+    if (!comment) return res.json({ success: false, error: '无权删除或不存在' })
+    dbRun('DELETE FROM mood_comments WHERE id = ?', [req.params.id])
+    res.json({ success: true })
+  } catch (e) {
+    res.json({ success: false, error: e.message })
+  }
+})
+
 // ==================== 互动 (拍一拍) ====================
 
 /** 拍一拍 */
@@ -389,6 +474,19 @@ router.post('/pat', authRequired, (req, res) => {
   try {
     const { toUserId, targetType, targetId, message } = req.body
     if (!toUserId) return res.json({ success: false, error: '请指定接收人' })
+
+    // 同一个目标 5 分钟内不能重复拍
+    const PAT_COOLDOWN_MS = 5 * 60 * 1000
+    const cooldownSince = new Date(Date.now() - PAT_COOLDOWN_MS).toISOString()
+    const recent = dbGet(
+      'SELECT id, createdAt FROM pats WHERE fromUserId = ? AND targetId = ? AND targetType = ? AND createdAt > ? ORDER BY createdAt DESC LIMIT 1',
+      [req.userId, targetId || null, targetType || 'wish', cooldownSince]
+    )
+    if (recent) {
+      const remaining = Math.ceil((new Date(recent.createdAt).getTime() + PAT_COOLDOWN_MS - Date.now()) / 1000)
+      return res.json({ success: false, error: `太快啦！${remaining}秒后再来拍吧～` })
+    }
+
     const id = uid('pat')
     const patMsg = message || `${req.user?.nickname || '有人'} 拍了拍你`
     dbRun(
