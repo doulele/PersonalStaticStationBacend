@@ -394,6 +394,185 @@ function parseVipVideoResults(data) {
   return items
 }
 
+// ==================== 共享海报搜索（TMDB + 豆瓣 双源互补） ====================
+
+const TMDB_API_KEY = config.tmdbApiKey || ''
+const TMDB_BASE = 'https://api.themoviedb.org/3'
+const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p/w500'
+
+/**
+ * 辅助：从标题中提取年份（如 "流浪地球 (2019)"、"Avatar 2009"）
+ */
+function extractYear(title) {
+  const m = String(title || '').match(/[\(（]?(\d{4})[\)）]?/)
+  return m ? m[1] : ''
+}
+
+/**
+ * 辅助：规范化标题（去空格、统一小写、去标点）
+ */
+function normTitle(t) {
+  return String(t || '')
+    .replace(/[\s\-_·•\.\,，。！!？?：:；;、\(\)（）\[\]【】《》<>"']/g, '')
+    .toLowerCase()
+}
+
+/**
+ * 通过 TMDB 搜索海报封面
+ * @returns {Promise<string>} - 海报 URL（原始尺寸），失败返回空
+ */
+async function searchTMDBPoster(title) {
+  if (!TMDB_API_KEY) return ''
+  try {
+    const cleanTitle = String(title || '').replace(/[\(（]\d{4}[\)）]/g, '').trim()
+    const year = extractYear(title)
+
+    // 多语言搜索（中文 + 英文），提升命中率
+    const queries = [cleanTitle]
+    // 如果标题含中文字符，也尝试去掉年份后的英文部分再搜一次
+    if (/[\u4e00-\u9fa5]/.test(cleanTitle) && cleanTitle.length > 1) {
+      queries.push(cleanTitle.replace(/\s+/g, ' ').split(' ')[0])
+    }
+
+    // 并行尝试 multi search（电影+电视剧+人）和 movie search
+    const searchUrls = queries.flatMap(q => {
+      const encoded = encodeURIComponent(q)
+      const params = `api_key=${TMDB_API_KEY}&query=${encoded}&language=zh-CN&page=1${year ? `&primary_release_year=${year}&year=${year}` : ''}`
+      return [
+        `${TMDB_BASE}/search/multi?${params}`,
+        `${TMDB_BASE}/search/movie?${params}`
+      ]
+    })
+
+    for (const url of searchUrls) {
+      try {
+        const res = await axios.get(url, {
+          timeout: 6000,
+          headers: {
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+          }
+        })
+
+        const items = res.data?.results || []
+        if (items.length === 0) continue
+
+        // 标题匹配
+        const rn = normTitle(title)
+        const best = items.find(item => {
+          const mediaTitle = item.title || item.name || ''
+          const tn = normTitle(mediaTitle)
+          return tn === rn || (tn && rn && (tn.includes(rn) || rn.includes(tn)))
+        }) || items[0]
+
+        if (best && best.poster_path) {
+          const posterUrl = `${TMDB_IMAGE_BASE}${best.poster_path}`
+          console.log(`[poster] TMDB 匹配: "${title}" → ${best.title || best.name} (${best.media_type || 'movie'})`)
+          return posterUrl
+        }
+      } catch (e) {
+        // 单次请求失败继续尝试下一个
+      }
+    }
+  } catch (e) {
+    console.log('[poster] TMDB 全局失败:', e.message)
+  }
+  return ''
+}
+
+/**
+ * 通过豆瓣搜索海报封面
+ * @returns {Promise<string>} - 豆瓣图片 URL（原始尺寸），失败返回空
+ */
+async function searchDoubanPoster(title) {
+  try {
+    const dRes = await axios.get('https://movie.douban.com/j/subject_suggest', {
+      params: { q: title },
+      timeout: 8000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Referer': 'https://movie.douban.com/'
+      }
+    })
+
+    const list = dRes.data || []
+    if (list.length === 0) return ''
+
+    const rn = normTitle(title)
+    const best = list.find(item => {
+      const tn = normTitle(item.title)
+      return tn === rn || (tn && rn && (tn.includes(rn) || rn.includes(tn)))
+    }) || list[0]
+
+    if (best && best.img) {
+      let rawPic = best.img
+      rawPic = rawPic
+        .replace(/\/view\/.*\/public\//, '/view/photo/m/public/')
+        .replace(/\/s_ratio_poster\//, '/l_ratio_poster/')
+      console.log(`[poster] 豆瓣匹配: "${title}" → ${best.title}`)
+      return rawPic
+    }
+  } catch (e) {
+    console.log(`[poster] 豆瓣请求失败 "${title}": ${e.message}`)
+  }
+  return ''
+}
+
+/**
+ * 统一海报搜索入口：TMDB → 豆瓣 → 兜底
+ * @param {string} title - 视频标题
+ * @returns {Promise<string>} - 经过 image-proxy 代理的海报 URL，无结果返回空
+ */
+async function searchPosterImage(title) {
+  if (!title) return ''
+
+  // 1. TMDB（国际内容覆盖好）
+  let rawPic = await searchTMDBPoster(title)
+
+  // 2. 豆瓣（中文内容覆盖好）
+  if (!rawPic) {
+    rawPic = await searchDoubanPoster(title)
+  }
+
+  // 3. 通过 image-proxy 代理（统一处理防盗链）
+  if (rawPic) {
+    const proxyBase = `/staticTool/api/video-parse/ytdlp/image-proxy`
+    return `${proxyBase}?url=${encodeURIComponent(rawPic)}`
+  }
+
+  return ''
+}
+
+/**
+ * 批量回填搜索结果的海报封面
+ * @param {Array} results - 搜索结果数组（会被原地修改）
+ * @param {number} limit - 最多处理前 N 条（0 = 全部）
+ * @param {string} tag - 日志标签
+ */
+async function enrichPosters(results, limit = 0, tag = '') {
+  const items = limit > 0 ? results.slice(0, limit) : results
+  const needCover = items.filter(r => !r.pic)
+  if (needCover.length === 0) return
+
+  const prefix = tag ? `[${tag}]` : ''
+  console.log(`${prefix} 无封面 ${needCover.length} 条，TMDB + 豆瓣搜索中...`)
+
+  const tasks = needCover.map(async (r) => {
+    const pic = await searchPosterImage(r.title)
+    return { item: r, pic }
+  })
+
+  const posterResults = await Promise.all(tasks)
+  let count = 0
+  for (const { item, pic } of posterResults) {
+    if (pic) {
+      item.pic = pic
+      count++
+    }
+  }
+  console.log(`${prefix} 海报回填完成: ${count}/${needCover.length} 条`)
+}
+
 // ==================== VIP视频 线路代理搜索 ====================
 
 /**
@@ -439,62 +618,8 @@ router.get('/proxy-search/line1', async (req, res, next) => {
 
     console.log(`[proxy line1] 解析完成: ${results.length} 条结果`)
 
-    // 线路1 API 不返回封面图 → 通过豆瓣搜索接口回填封面
-    const needDoubanCover = results.some(r => !r.pic)
-    if (needDoubanCover && results.length > 0) {
-      console.log(`[proxy line1] 无封面图，尝试豆瓣获取封面（共 ${results.length} 条）...`)
-      // 并行搜索前5个结果的豆瓣封面
-      const doubanTasks = results.slice(0, 5).map(async (r, idx) => {
-        try {
-          const dRes = await axios.get('https://movie.douban.com/j/subject_suggest', {
-            params: { q: r.title },
-            timeout: 8000,
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-              'Referer': 'https://movie.douban.com/'
-            }
-          })
-          const list = dRes.data || []
-          console.log(`[proxy line1] 豆瓣搜索 "${r.title}" 返回 ${list.length} 条`)
-          if (list.length > 0) {
-            console.log(`[proxy line1]   豆瓣第1条: title="${list[0].title}" img="${(list[0].img || '').substring(0, 80)}"`)
-          }
-          // 找到标题最匹配的条目
-          const best = list.find(item =>
-            item.title === r.title ||
-            (item.title && r.title && (
-              item.title.includes(r.title) || r.title.includes(item.title)
-            ))
-          ) || list[0]
-          if (best && best.img) {
-            // 取原始图片 URL
-            let rawPic = best.img
-            // 豆瓣图片通常尺寸较小，替换为中等尺寸
-            rawPic = rawPic.replace(/\/view\/.*\/public\//, '/view/photo/m/public/').replace(/\/s_ratio_poster\//, '/l_ratio_poster/')
-            // 通过图片代理避免豆瓣防盗链
-            const proxyBase = `/staticTool/api/video-parse/ytdlp/image-proxy`
-            const pic = `${proxyBase}?url=${encodeURIComponent(rawPic)}`
-            console.log(`[proxy line1] 豆瓣封面: "${r.title}" → ${rawPic.substring(0, 80)}`)
-            return { index: idx, pic }
-          } else {
-            console.log(`[proxy line1] 豆瓣未找到匹配封面: "${r.title}" (best.img=${best?.img || '无'})`)
-          }
-        } catch (e) {
-          console.log(`[proxy line1] 豆瓣请求失败 "${r.title}": ${e.message}`)
-        }
-        return null
-      })
-
-      const doubanResults = await Promise.all(doubanTasks)
-      let coverCount = 0
-      for (const dr of doubanResults) {
-        if (dr) {
-          results[dr.index].pic = dr.pic
-          coverCount++
-        }
-      }
-      console.log(`[proxy line1] 豆瓣封面回填完成: ${coverCount}/${doubanResults.length} 条有封面`)
-    }
+    // 回填封面：TMDB → 豆瓣（双源互补，前5条并行搜索）
+    await enrichPosters(results, 5, 'proxy line1')
 
     if (results.length > 0) {
       console.log(`[proxy line1] 第一条:`, JSON.stringify(results[0]))
@@ -609,55 +734,8 @@ router.get('/proxy-search/line2', async (req, res, next) => {
 
     console.log(`[proxy line2] 解析结果: ${results.length} 条`)
 
-    // ylu.cc API 不返回封面图 → 通过豆瓣搜索接口回填封面
-    const needDoubanCover = results.some(r => !r.pic)
-    if (needDoubanCover && results.length > 0) {
-      console.log(`[proxy line2] 无封面图，尝试豆瓣获取封面（共 ${results.length} 条）...`)
-      const doubanTasks = results.slice(0, 5).map(async (r, idx) => {
-        try {
-          const dRes = await axios.get('https://movie.douban.com/j/subject_suggest', {
-            params: { q: r.title },
-            timeout: 8000,
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-              'Referer': 'https://movie.douban.com/'
-            }
-          })
-          const list = dRes.data || []
-          console.log(`[proxy line2] 豆瓣搜索 "${r.title}" 返回 ${list.length} 条`)
-          if (list.length > 0) {
-            console.log(`[proxy line2]   豆瓣第1条: title="${list[0].title}" img="${(list[0].img || '').substring(0, 80)}"`)
-          }
-          const best = list.find(item =>
-            item.title === r.title ||
-            (item.title && r.title && (
-              item.title.includes(r.title) || r.title.includes(item.title)
-            ))
-          ) || list[0]
-          if (best && best.img) {
-            let rawPic = best.img
-            rawPic = rawPic.replace(/\/view\/.*\/public\//, '/view/photo/m/public/').replace(/\/s_ratio_poster\//, '/l_ratio_poster/')
-            const proxyBase = `/staticTool/api/video-parse/ytdlp/image-proxy`
-            const pic = `${proxyBase}?url=${encodeURIComponent(rawPic)}`
-            console.log(`[proxy line2] 豆瓣封面: "${r.title}" → ${rawPic.substring(0, 80)}`)
-            return { index: idx, pic }
-          }
-        } catch (e) {
-          console.log(`[proxy line2] 豆瓣请求失败 "${r.title}": ${e.message}`)
-        }
-        return null
-      })
-
-      const doubanResults = await Promise.all(doubanTasks)
-      let coverCount = 0
-      for (const dr of doubanResults) {
-        if (dr) {
-          results[dr.index].pic = dr.pic
-          coverCount++
-        }
-      }
-      console.log(`[proxy line2] 豆瓣封面回填完成: ${coverCount}/${doubanTasks.length} 条有封面`)
-    }
+    // 回填封面：TMDB → 豆瓣（双源互补，前5条并行搜索）
+    await enrichPosters(results, 5, 'proxy line2')
 
     setVipCachedSearch(2, kw, results)
 
@@ -805,56 +883,7 @@ router.get('/hls-proxy', async (req, res, next) => {
     next(err)
   }
 })
-
-/**
- * GET /video-parse/proxy-page?url=<encoded_page_url>
- * 代理外部页面（用于 iframe 内嵌），自动剥离 X-Frame-Options / CSP frame-ancestors
- * 解决 ylu.cc 等站点禁止 iframe 嵌入导致的移动端黑屏问题
- */
-router.get('/proxy-page', async (req, res, next) => {
-  try {
-    const { url } = req.query
-    if (!url) return res.status(400).json({ code: -1, message: '缺少 url 参数' })
-
-    const response = await axios.get(url, {
-      timeout: 20000,
-      responseType: 'text',
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-        'Referer': new URL(url).origin + '/'
-      },
-      httpsAgent: insecureAgent,
-      maxRedirects: 5
-    })
-
-    let html = response.data
-    // 注入 <base> 标签以修复相对路径（CSS/JS/图片等从源站加载）
-    const baseOrigin = new URL(url).origin
-    if (!/<base\s/i.test(html)) {
-      html = html.replace(/<head[^>]*>/i, `$&\n<base href="${baseOrigin}/">`)
-    }
-
-    res.set({
-      'Content-Type': 'text/html; charset=utf-8',
-      'Access-Control-Allow-Origin': '*',
-      // 明确不设置 X-Frame-Options，允许被任意 iframe 嵌入
-      'X-Frame-Options': '',
-      'Cache-Control': 'no-cache'
-    })
-    // 移除可能存在的 X-Frame-Options（某些库会自动添加）
-    res.removeHeader('X-Frame-Options')
-    res.send(html)
-  } catch (err) {
-    console.error('[proxy-page] 代理失败:', err.message)
-    if (!res.headersSent) {
-      res.setHeader('Access-Control-Allow-Origin', '*')
-      res.status(502).json({ code: -1, message: '页面代理失败: ' + err.message })
-    }
-  }
-})
-
+// ==================== HLS 分片代理 ====================
 /**
  * GET /video-parse/hls-segment?url=<encoded_ts_url>
  * 代理 .ts 分片数据
@@ -2106,21 +2135,22 @@ router.get('/ytdlp/image-proxy', async (req, res) => {
     }
 
     // 根据图片域名自动选择 Referer
-    let referer = 'https://www.bilibili.com/'
+    let referer = ''
     if (ref) {
       referer = decodeURIComponent(ref)
-    } else if (proxyUrl.includes('douban')) {
-      referer = 'https://movie.douban.com/'
-    } else if (proxyUrl.includes('doubanio.com')) {
+    } else if (proxyUrl.includes('douban') || proxyUrl.includes('doubanio.com')) {
       referer = 'https://movie.douban.com/'
     }
+    // TMDB 图片不需要特定 Referer，直接用空
+
+    const fetchHeaders = {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
+    if (referer) fetchHeaders['Referer'] = referer
 
     const response = await axios.get(proxyUrl, {
       responseType: 'arraybuffer',
-      headers: {
-        'Referer': referer,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      },
+      headers: fetchHeaders,
       timeout: 10000
     })
 
@@ -2215,103 +2245,6 @@ router.get('/ytdlp/lyrics', async (req, res) => {
     res.json({ code: 0, data: { syncedLyrics: '', plainLyrics: '', message: '歌词服务暂不可用' } })
   }
 })
-
-// ==================== 页面代理（绕过 X-Frame-Options） ====================
-/**
- * GET /video-parse/proxy-page?url=<encoded_url>
- * 代理第三方页面，移除 X-Frame-Options 等禁止内嵌的头，支持在 iframe 中播放
- * 用于 ylu.cc 等网站的视频播放页内嵌
- */
-router.get('/proxy-page', async (req, res, next) => {
-  try {
-    let { url } = req.query
-    if (!url) {
-      return res.status(400).json({ code: -1, message: '缺少页面地址 ?url=' })
-    }
-
-    // 兼容被双重编码的 URL（前端可能已编码一次，浏览器再编码一次）
-    try {
-      url = decodeURIComponent(url)
-    } catch {}
-
-    console.log(`[proxy-page] 代理页面: ${url.substring(0, 150)}`)
-
-    const targetUrl = new URL(url)
-    const isYluCc = targetUrl.hostname.includes('ylu.cc')
-
-    // ylu.cc 需要 cookie
-    const extraHeaders = {}
-    if (isYluCc) {
-      const yluCookie = await getYluCookie()
-      if (yluCookie) {
-        extraHeaders.Cookie = yluCookie
-      }
-    }
-
-    const response = await axios.get(url, {
-      timeout: 20000,
-      responseType: 'text',
-      maxRedirects: 5,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-        'Referer': targetUrl.origin + '/',
-        'Origin': targetUrl.origin,
-        ...extraHeaders
-      },
-      httpsAgent: new https.Agent({ rejectUnauthorized: false })
-    })
-
-    let html = typeof response.data === 'string' ? response.data : JSON.stringify(response.data)
-
-    console.log(`[proxy-page] 响应长度: ${html.length}, 前200字符:`, html.substring(0, 200))
-
-    // 检测 ylu.cc 反爬提示
-    if (isYluCc && html.includes('请勿非法调用')) {
-      console.warn('[proxy-page] ylu.cc 返回反爬提示，清除 cookie 缓存重试一次')
-      yluCookieCache = ''
-      yluCookieExpires = 0
-      const newCookie = await getYluCookie()
-      if (newCookie) {
-        // 重试
-        const retryResp = await axios.get(url, {
-          timeout: 20000,
-          responseType: 'text',
-          maxRedirects: 5,
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-            'Referer': targetUrl.origin + '/',
-            'Origin': targetUrl.origin,
-            Cookie: newCookie
-          },
-          httpsAgent: new https.Agent({ rejectUnauthorized: false })
-        })
-        html = typeof retryResp.data === 'string' ? retryResp.data : JSON.stringify(retryResp.data)
-      }
-    }
-
-    // 注入 <base> 标签，确保相对路径资源正确加载
-    html = html.replace(/<head[^>]*>/i, match => {
-      return match + `\n<base href="${targetUrl.origin}/">`
-    })
-
-    res.setHeader('Content-Type', 'text/html; charset=utf-8')
-    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate')
-    // 不设置 X-Frame-Options，允许 iframe 内嵌
-    res.removeHeader('X-Frame-Options')
-    res.send(html)
-  } catch (err) {
-    console.error('[proxy-page] 代理失败:', err.message)
-    if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
-      return res.status(504).json({ code: -1, message: '页面加载超时，请重试' })
-    }
-    next(err)
-  }
-})
-
 // ==================== VIP视频 线路五（tv.chen-dong.com）代理 ====================
 
 /**
@@ -2387,65 +2320,21 @@ router.get('/proxy-search/line5', async (req, res, next) => {
     let results = parseVipVideoResults(jsonData)
     console.log(`[proxy line5] 解析结果: ${results.length} 条`)
 
-    // chen-dong API 结果：优先使用接口返回的封面图（通过 image-proxy 代理，避免防盗链）
+    // chen-dong API 返回的封面图通过 image-proxy 代理（避免防盗链）
     const IMG_PROXY = `/staticTool/api/video-parse/ytdlp/image-proxy`
     let directCoverCount = 0
     for (const r of results) {
       if (r.pic && /^https?:\/\//i.test(r.pic)) {
-        console.log(`[proxy line5] 接口自带封面: "${r.title}" → ${r.pic.substring(0, 80)}`)
         r.pic = `${IMG_PROXY}?url=${encodeURIComponent(r.pic)}`
         directCoverCount++
       }
     }
     if (directCoverCount > 0) {
-      console.log(`[proxy line5] 接口自带封面使用: ${directCoverCount}/${results.length} 条`)
+      console.log(`[proxy line5] 接口自带封面: ${directCoverCount}/${results.length} 条`)
     }
 
-    // 仅对仍无封面的结果 → 通过豆瓣搜索接口回填封面
-    const needDoubanCover = results.some(r => !r.pic)
-    if (needDoubanCover && results.length > 0) {
-      console.log(`[proxy line5] 无封面图，尝试豆瓣获取封面（共 ${results.length} 条）...`)
-      // 辅助：去空格/统一大小写，提升标题匹配准确度
-      const normTitle = t => String(t || '').replace(/\s+/g, '').toLowerCase()
-      const doubanTasks = results.map(async (r, idx) => {
-        try {
-          const dRes = await axios.get('https://movie.douban.com/j/subject_suggest', {
-            params: { q: r.title },
-            timeout: 8000,
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-              'Referer': 'https://movie.douban.com/'
-            }
-          })
-          const list = dRes.data || []
-          if (list.length === 0) return { index: idx, pic: '' }
-          const rn = normTitle(r.title)
-          const best = list.find(item => {
-            const tn = normTitle(item.title)
-            return tn === rn || (tn && rn && (tn.includes(rn) || rn.includes(tn)))
-          }) || list[0]
-          if (best && best.img && best.img !== 'null' && best.img !== 'undefined') {
-            let rawPic = best.img
-            rawPic = rawPic.replace(/\/view\/.*\/public\//, '/view/photo/m/public/').replace(/\/s_ratio_poster\//, '/l_ratio_poster/')
-            const proxyBase = `/staticTool/api/video-parse/ytdlp/image-proxy`
-            return { index: idx, pic: `${proxyBase}?url=${encodeURIComponent(rawPic)}` }
-          }
-          return { index: idx, pic: '' }
-        } catch (e) {
-          console.log(`[proxy line5] 豆瓣回填失败 "${r.title}": ${e.message}`)
-          return { index: idx, pic: '' }
-        }
-      })
-      const doubanResults = await Promise.all(doubanTasks)
-      let coverCount = 0
-      for (const dr of doubanResults) {
-        if (dr && dr.pic) {
-          results[dr.index].pic = dr.pic
-          coverCount++
-        }
-      }
-      console.log(`[proxy line5] 豆瓣封面回填完成: ${coverCount}/${doubanResults.length} 条有封面`)
-    }
+    // 回填封面：TMDB → 豆瓣（双源互补，并行搜索全部结果）
+    await enrichPosters(results, 0, 'proxy line5')
 
     setVipCachedSearch(5, kw, results)
 
@@ -2457,6 +2346,96 @@ router.get('/proxy-search/line5', async (req, res, next) => {
     }
     if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') {
       return res.status(502).json({ code: -1, message: '线路五接口暂时不可用' })
+    }
+    next(err)
+  }
+})
+
+/**
+ * GET /video-parse/proxy-search/line6
+ * 代理线路六（4kcz.com 厂长资源）搜索请求（HTML 解析）
+ * Query: ?keyword=视频名称
+ * 返回: { code: 0, data: [{title, pic, type, desc, url}, ...] }
+ */
+router.get('/proxy-search/line6', async (req, res, next) => {
+  try {
+    const { keyword } = req.query
+    if (!keyword || !keyword.trim()) {
+      return res.status(400).json({ code: -1, message: '缺少搜索关键词 ?keyword=' })
+    }
+
+    const kw = keyword.trim()
+
+    // 缓存检查
+    const cached = getVipCachedSearch(6, kw)
+    if (cached) {
+      return res.json({ code: 0, data: cached, cached: true })
+    }
+
+    const targetUrl = `https://www.4kcz.com/boss1O1?q=${encodeURIComponent(kw)}`
+    console.log(`[proxy line6] 代理请求: "${kw}" → ${targetUrl}`)
+
+    const response = await axios.get(targetUrl, {
+      timeout: 15000,
+      responseType: 'text',
+      httpsAgent: insecureAgent,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml',
+        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        'Referer': 'https://www.4kcz.com/'
+      }
+    })
+
+    const html = typeof response.data === 'string' ? response.data : String(response.data)
+    console.log(`[proxy line6] HTML 响应长度: ${html.length}`)
+
+    // 解析搜索结果：每项格式为 <li><a href="..."><img src="..." alt="标题"></a><h3 class="dytit"><a>标题</a></h3>...</li>
+    const results = []
+    const liRegex = /<li>\s*<a\s+href="([^"]*)"[^>]*>\s*<img\s+src="([^"]*)"\s+alt="([^"]*)"[^>]*>\s*<\/a>\s*<h3[^>]*><a[^>]*>([^<]*)<\/a>\s*<\/h3>/gi
+    let match
+    while ((match = liRegex.exec(html)) !== null) {
+      const [_, href, pic, imgAlt, titleText] = match
+      const title = (titleText || imgAlt || '').trim()
+      if (!title) continue
+
+      // 拼接完整 URL
+      const detailUrl = href.startsWith('http') ? href : `https://www.4kcz.com${href.startsWith('/') ? '' : '/'}${href}`
+
+      results.push({
+        title,
+        pic: (pic && /^https?:\/\//i.test(pic)) ? pic : '',
+        type: '',
+        desc: '来源：厂长资源',
+        url: detailUrl
+      })
+    }
+
+    console.log(`[proxy line6] 解析结果: ${results.length} 条`)
+    if (results.length === 0) {
+      return res.json({ code: 0, data: [], total: 0, message: '未找到相关视频' })
+    }
+
+    // 封面走 image-proxy 代理（避免百度/腾讯图片防盗链）
+    const IMG_PROXY = `/staticTool/api/video-parse/ytdlp/image-proxy`
+    for (const r of results) {
+      if (r.pic && /^https?:\/\//i.test(r.pic)) {
+        r.pic = `${IMG_PROXY}?url=${encodeURIComponent(r.pic)}`
+      }
+    }
+
+    // 回填封面：TMDB → 豆瓣（双源互补，无封面的前5条搜索）
+    await enrichPosters(results, 5, 'proxy line6')
+
+    setVipCachedSearch(6, kw, results)
+    res.json({ code: 0, data: results, total: results.length })
+  } catch (err) {
+    console.error('[proxy line6] 代理失败:', err.message)
+    if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT') {
+      return res.status(504).json({ code: -1, message: '线路六搜索超时，请重试' })
+    }
+    if (err.code === 'ECONNREFUSED' || err.code === 'ENOTFOUND') {
+      return res.status(502).json({ code: -1, message: '线路六接口暂时不可用' })
     }
     next(err)
   }

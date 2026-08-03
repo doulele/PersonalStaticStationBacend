@@ -66,6 +66,10 @@ export default {
   // 注册邀请码
   inviteCode: process.env.INVITE_CODE || '',
 
+  // TMDB API Key（免费注册 https://www.themoviedb.org/settings/api）
+  // 用于搜索电影/电视剧海报封面，作为豆瓣的互补数据源
+  tmdbApiKey: process.env.TMDB_API_KEY || '',
+
   // yt-dlp 配置
   ytDlp: {
     // yt-dlp 可执行文件路径，留空则在 PATH 中查找
