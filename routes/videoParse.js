@@ -723,11 +723,9 @@ router.get('/hls-proxy', async (req, res, next) => {
       })
     }
 
-    // 代理端点使用完整绝对 URL，避免 hls.js 相对路径解析歧义
-    const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https'
-    const host = req.get('host') || 'wellwin.top'
-    const origin = `${proto}://${host}`
-    const segProxyBase = `${origin}/staticTool/api/video-parse/hls-segment?url=`
+    // 使用站点相对路径，本地走 Vite proxy，线上走 nginx proxy
+    const segProxyBase = `/staticTool/api/video-parse/hls-segment?url=`
+    const playlistProxyBase = `/staticTool/api/video-parse/hls-proxy?url=`
 
     /**
      * 使用标准 URL 构造函数将 uri 转为源站绝对地址
@@ -768,9 +766,11 @@ router.get('/hls-proxy', async (req, res, next) => {
       // 跳过其他注释行、空行
       if (!trimmed || trimmed.startsWith('#')) return line
 
-      // 重写资源 URL（.ts / .m3u8）
+      // 重写资源 URL：.m3u8 子播放列表走 hls-proxy，.ts 分片走 hls-segment
       const absoluteUrl = resolveAbsUrl(trimmed)
-      return `${segProxyBase}${encodeURIComponent(absoluteUrl)}`
+      const isPlaylist = /\.m3u8(\?|$)/i.test(absoluteUrl)
+      const proxyBase = isPlaylist ? playlistProxyBase : segProxyBase
+      return `${proxyBase}${encodeURIComponent(absoluteUrl)}`
     })
 
     m3u8Content = rewritten.join('\n')
@@ -2601,12 +2601,9 @@ router.get('/hls-proxy', async (req, res) => {
       m3u8Content = String(m3u8Content)
     }
 
-    // 构造代理 URL（使用完整绝对 URL，避免 hls.js 相对路径解析歧义）
-    const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https'
-    const host = req.get('host') || 'wellwin.top'
-    const origin = `${proto}://${host}`
-    const segProxyBase = `${origin}/staticTool/api/video-parse/hls-segment?url=`
-    const playlistProxyBase = `${origin}/staticTool/api/video-parse/hls-proxy?url=`
+    // 使用站点相对路径，本地走 Vite proxy，线上走 nginx proxy
+    const segProxyBase = `/staticTool/api/video-parse/hls-segment?url=`
+    const playlistProxyBase = `/staticTool/api/video-parse/hls-proxy?url=`
 
     function resolveAbsUrl(uri) {
       try {
@@ -2678,8 +2675,12 @@ router.get('/hls-segment', async (req, res) => {
       return res.status(400).json({ code: -1, message: '不支持的 URL 协议' })
     }
 
+    // 安全网：如果意外请求了 .m3u8 播放列表，按文本获取并返回（不走 stream 避免 500）
+    const isPlaylist = /\.m3u8(\?|$)/i.test(targetUrl)
+    const responseType = isPlaylist ? 'text' : 'stream'
+
     const response = await axios.get(targetUrl, {
-      responseType: 'stream',
+      responseType,
       timeout: 30000,
       maxRedirects: 5,
       headers: {
@@ -2690,6 +2691,18 @@ router.get('/hls-segment', async (req, res) => {
       },
       httpsAgent: insecureAgent
     })
+
+    if (isPlaylist) {
+      console.log(`[hls-segment] 检测到 .m3u8 意外请求，按文本返回: ${targetUrl.substring(0, 80)}`)
+      res.set({
+        'Content-Type': 'application/vnd.apple.mpegurl',
+        'Access-Control-Allow-Origin': '*',
+        'Cache-Control': 'no-cache'
+      })
+      // 不重写内部 URL（上游 hls-proxy 已经处理过），直接返回原始内容
+      res.send(response.data)
+      return
+    }
 
     const ct = response.headers['content-type'] || 'video/mp2t'
     res.set({
