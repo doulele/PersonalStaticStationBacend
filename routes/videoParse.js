@@ -142,13 +142,8 @@ function getRefererForUrl(url) {
 // 每个接口有 name（名称）、api（接口地址模板，用 {url} 占位）、timeout（超时ms）
 const PARSE_APIS = [
   { name: '线路一', api: 'https://jx.m3u8.tv/jiexi/?url={url}', timeout: 15000 },
-  { name: '线路二', api: 'https://vip.bljiex.com/?v={url}', timeout: 15000 },
-  { name: '线路三', api: 'https://jx.618g.com/?url={url}', timeout: 15000 },
-  { name: '线路四', api: 'https://z1.m1907.top/?jx={url}', timeout: 15000 },
-  { name: '线路五', api: 'https://jx.playerjx.com/?url={url}', timeout: 15000 },
-  { name: '线路六', api: 'https://jx.nnxv.cn/tv.php?url={url}', timeout: 15000 },
-  { name: '线路七', api: 'https://www.8090g.cn/jiexi/?url={url}', timeout: 15000 },
-  { name: '线路八', api: 'https://www.playm3u8.cn/jiexi.php?url={url}', timeout: 15000 }
+  { name: '线路二', api: 'https://jx.xmflv.com/?url={url}', timeout: 15000 },
+  { name: '线路三', api: 'https://www.8090g.cn/?url={url}', timeout: 15000 }
 ]
 
 // 用于测试连通性的示例视频 URL（腾讯视频免费集）
@@ -2699,5 +2694,117 @@ router.get('/hls-segment', async (req, res) => {
     }
   }
 })
+
+// ==================== 网页标题抓取 ====================
+// GET /video-parse/page-title?url=xxx
+// 用于从第三方视频页面 URL 提取真实的视频标题
+router.get('/page-title', async (req, res) => {
+  let title = ''
+  try {
+    const { url } = req.query
+    if (!url) {
+      return res.status(400).json({ code: -1, message: '缺少 url 参数' })
+    }
+
+    // 策略0：优先通过 dmku.hls.one 等第三方信息接口获取标题（精确到剧集名）
+    const dmkuTitle = await extractTitleFromDmku(url)
+    if (dmkuTitle) {
+      title = dmkuTitle
+    }
+
+    // 策略1-3：网页 HTML 抓取
+    if (!title) {
+      try {
+        const response = await axios.get(url, {
+          timeout: 8000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml',
+            'Accept-Language': 'zh-CN,zh;q=0.9'
+          },
+          maxRedirects: 5,
+          httpsAgent: insecureAgent
+        })
+        const html = typeof response.data === 'string' ? response.data : String(response.data)
+
+        // og:title
+        const ogTitleMatch = html.match(/<meta[^>]+property="og:title"[^>]+content="([^"]*)"/i)
+            || html.match(/<meta[^>]+content="([^"]*)"[^>]+property="og:title"/i)
+        if (ogTitleMatch) title = ogTitleMatch[1]
+
+        // <title> 标签
+        if (!title) {
+          const titleMatch = html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
+          if (titleMatch) title = titleMatch[1].replace(/[\r\n\t\s]+/g, ' ').trim()
+        }
+
+        // h1
+        if (!title) {
+          const h1Match = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)
+          if (h1Match) title = h1Match[1].replace(/<[^>]+>/g, '').replace(/[\r\n\t\s]+/g, ' ').trim()
+        }
+
+        // 常见后缀清理
+        title = title.replace(/\s*[-–—|_]\s*(腾讯视频|爱奇艺|优酷|芒果TV|哔哩哔哩|bilibili|YouTube).*$/i, '').trim()
+      } catch {
+        // HTML 抓取失败不影响，继续走兜底
+      }
+    }
+
+    if (!title) {
+      title = extractTitleFromUrl(url)
+    }
+
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.json({ code: 0, data: { title } })
+  } catch (err) {
+    const fallbackTitle = extractTitleFromUrl(req.query.url || '')
+    res.setHeader('Access-Control-Allow-Origin', '*')
+    res.json({ code: 0, data: { title: fallbackTitle } })
+  }
+})
+
+// 通过 dmku.hls.one 等接口提取精确标题（剧名 => 集数）
+async function extractTitleFromDmku(videoUrl) {
+  try {
+    const dmkuUrl = `https://dmku.hls.one/?ac=list&url=${encodeURIComponent(videoUrl)}`
+    const res = await axios.get(dmkuUrl, {
+      timeout: 6000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      },
+      httpsAgent: insecureAgent
+    })
+    const data = typeof res.data === 'string' ? JSON.parse(res.data) : res.data
+    if (data?.vod_code === 200 && data.vod_title) {
+      // 尝试匹配当前播集名
+      const episodeName = data.vod_episodes?.find(ep => ep.url === videoUrl)?.name
+          || data.vod_episodes?.find(ep => videoUrl.includes(ep.url?.split('/').pop()?.split('.')[0]))?.name
+      if (episodeName) {
+        return `${data.vod_title} ${episodeName}`
+      }
+      return data.vod_title
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+// 从 URL 提取兜底标题
+function extractTitleFromUrl(url) {
+  try {
+    const u = new URL(url)
+    const host = u.hostname.replace(/^www\./, '')
+    const parts = u.pathname.split('/').filter(Boolean)
+    if (parts.length > 0) {
+      const last = parts[parts.length - 1].replace(/\.(html?|php|aspx?|jsp)$/, '')
+      return last.length > 2 ? last : host
+    }
+    return host
+  } catch {
+    return (url || '').substring(0, 30)
+  }
+}
 
 export default router
