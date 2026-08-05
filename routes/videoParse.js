@@ -2630,7 +2630,8 @@ async function doSearch(searchQuery, timeoutMs) {
       ]),
       searchQuery
     ]
-    const result = await runYtDlp(args, timeoutMs)
+    // B站搜索传 B站 URL 让 runYtDlp 通过 getCookieFileForUrl 自动加载 cookies/bilibili.txt
+    const result = await runYtDlp(args, timeoutMs, isBili ? 'https://www.bilibili.com/' : '')
     const lines = (result.stdout || '').split('\n').filter(Boolean)
     return lines.map(line => {
       try {
