@@ -7,6 +7,8 @@ import config from './config/index.js'
 import routes from './routes/index.js'
 import { errorHandler, notFoundHandler } from './middlewares/errorHandler.js'
 import { initDatabase } from './services/db.js'
+import cron from 'node-cron'
+import { runDailyTask } from './services/nationalTeamService.js'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -56,6 +58,18 @@ import { createServer } from 'http'
 async function startServer() {
   // 初始化 SQLite 数据库
   await initDatabase()
+
+  // 国家队动向监测 — 每晚 23:30 自动执行
+  cron.schedule('30 23 * * *', async () => {
+    const dateStr = new Date().toISOString().slice(0, 10)
+    console.log(`\n[NT Cron] 定时任务触发: ${dateStr} 23:30`)
+    try {
+      await runDailyTask(dateStr)
+    } catch (err) {
+      console.error('[NT Cron] 定时任务执行失败:', err.message)
+    }
+  }, { timezone: 'Asia/Shanghai' })
+  console.log('[NT Cron] 已注册定时任务：每天 23:30 (Asia/Shanghai)')
 
   const server = createServer(app)
 

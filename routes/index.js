@@ -18,6 +18,7 @@ import wishTreeHoleRoutes from './wishTreeHole.js'
 import taskAlchemistRoutes from './taskAlchemist.js'
 import eternalArchiveRoutes from './eternalArchive.js'
 import recipeLabRoutes from './recipeLab.js'
+import nationalTeamRoutes from './nationalTeam.js'
 
 const router = Router()
 
@@ -50,6 +51,7 @@ router.use('/wish-tree-hole', wishTreeHoleRoutes)
 router.use('/task-alchemist', taskAlchemistRoutes)
 router.use('/eternal-archive', eternalArchiveRoutes)
 router.use('/recipe-lab', recipeLabRoutes)
+router.use('/national-team', nationalTeamRoutes)
 
 // 健康检查
 router.get('/health', (req, res) => {

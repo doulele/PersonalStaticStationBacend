@@ -595,6 +595,69 @@ function createTables() {
       FOREIGN KEY (userId) REFERENCES users(userId)
     )
   `)
+
+  // ========== 国家队动向监测 相关表 ==========
+
+  // ETF每日数据表
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS nt_etf_daily (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      date TEXT NOT NULL,
+      code TEXT NOT NULL,
+      name TEXT NOT NULL,
+      close_price REAL,
+      open_price REAL,
+      high_price REAL,
+      low_price REAL,
+      volume REAL,
+      amount REAL,
+      total_shares REAL,
+      total_nav REAL,
+      share_change REAL,
+      share_change_pct REAL,
+      data_source TEXT,
+      created_at TEXT DEFAULT (datetime('now','localtime')),
+      UNIQUE(date, code)
+    )
+  `)
+
+  // 信号记录表
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS nt_signals (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      date TEXT NOT NULL,
+      agency TEXT NOT NULL,
+      overall_score REAL,
+      volume_factor REAL,
+      share_factor REAL,
+      direction_factor REAL,
+      signal_level TEXT,
+      signal_label TEXT,
+      suggestion TEXT,
+      suggested_position REAL,
+      is_burst INTEGER DEFAULT 0,
+      consecutive_days INTEGER DEFAULT 1,
+      cost_line REAL,
+      hs300_change REAL,
+      etf_scores TEXT,
+      created_at TEXT DEFAULT (datetime('now','localtime')),
+      UNIQUE(date, agency)
+    )
+  `)
+
+  // 手动触发日志表
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS nt_trigger_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      started_at TEXT NOT NULL,
+      finished_at TEXT,
+      status TEXT DEFAULT 'running',
+      error_msg TEXT,
+      data_count INTEGER DEFAULT 0,
+      duration_ms INTEGER,
+      source_used TEXT
+    )
+  `)
 }
 
 // ==================== 持久化 ====================
