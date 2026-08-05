@@ -1629,6 +1629,137 @@ router.post('/ytdlp/download', async (req, res, next) => {
   }
 })
 
+// ==================== 无水印下载 ====================
+
+/**
+ * POST /video-parse/ytdlp/no-watermark-download
+ * 先提取视频元信息，过滤掉带水印的格式，再下载最佳无水印版本
+ * Body: { url, title? }
+ *   - url: 视频链接（抖音/快手等）
+ *   - title: 可选，用于设置下载文件名
+ */
+router.post('/ytdlp/no-watermark-download', async (req, res, next) => {
+  try {
+    if (!ytDlpAvailable) {
+      return res.status(503).json({ code: -1, message: 'yt-dlp 未安装或不可用' })
+    }
+    const { url: videoUrl, title: givenTitle } = req.body
+    if (!videoUrl) {
+      return res.status(400).json({ code: -1, message: '缺少视频链接' })
+    }
+
+    // Step 1: dump-json 获取所有格式
+    let videoInfo
+    try {
+      const result = await runYtDlp(['-j', '--no-playlist', videoUrl], timeout * 2, videoUrl)
+      videoInfo = JSON.parse(result.stdout)
+    } catch (e) {
+      return res.status(400).json({ code: -1, message: '提取视频信息失败: ' + ((e.stderr || e.message || '').substring(0, 200)) })
+    }
+
+    // Step 2: 过滤无水印格式
+    const formats = videoInfo.formats || []
+    let cleanFormats = formats.filter(f => {
+      const note = (f.format_note || '').toLowerCase()
+      const acodec = (f.acodec || '').toLowerCase()
+      // 排除明显的水印标记 / 只有音频的 / 纯图片格式
+      if (note.includes('watermark') || note.includes('水印')) return false
+      if (note.includes('logo') || note.includes('贴纸')) return false
+      return true
+    })
+
+    if (cleanFormats.length === 0) {
+      cleanFormats = formats
+    }
+
+    // 分离视频流和音频流
+    const videoFormats = cleanFormats.filter(f => f.vcodec && f.vcodec !== 'none' && f.width > 0)
+    const audioFormats = cleanFormats.filter(f => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none'))
+    const combinedFormats = cleanFormats.filter(f => f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none')
+
+    let formatSelector = 'best'
+    if (combinedFormats.length > 0) {
+      // 优先选择音视频一体的格式，按分辨率降序
+      combinedFormats.sort((a, b) => (b.height || 0) - (a.height || 0))
+      formatSelector = combinedFormats[0].format_id
+    } else if (videoFormats.length > 0 && audioFormats.length > 0) {
+      // 视频流 + 音频流合并
+      videoFormats.sort((a, b) => (b.height || 0) - (a.height || 0))
+      audioFormats.sort((a, b) => (b.abr || 0) - (a.abr || 0))
+      formatSelector = `${videoFormats[0].format_id}+${audioFormats[0].format_id}`
+    } else if (videoFormats.length > 0) {
+      videoFormats.sort((a, b) => (b.height || 0) - (a.height || 0))
+      formatSelector = videoFormats[0].format_id
+    }
+
+    console.log(`[no-watermark] selected format: ${formatSelector}, clean/total: ${cleanFormats.length}/${formats.length}`)
+
+    // Step 3: 使用选中的 format 下载
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ytdlp-nw-'))
+    const outTemplate = path.join(tmpDir, 'output.%(ext)s')
+
+    const args = [
+      '--no-playlist',
+      '--no-check-certificate',
+      '-o', outTemplate,
+      '-f', formatSelector
+    ]
+    if (proxy) args.push('--proxy', proxy)
+    if (cookieFile) args.push('--cookies', cookieFile)
+    args.push(videoUrl)
+
+    const cmd = `"${binPath}" ${args.map(a => `"${a}"`).join(' ')}`
+    await new Promise((resolvePromise, rejectPromise) => {
+      const proc = spawn(cmd, { shell: true, windowsHide: true })
+      let stderr = ''
+      proc.stderr.on('data', d => { stderr += d.toString() })
+      proc.on('error', err => rejectPromise(err))
+      proc.on('close', code => {
+        if (code === 0) resolvePromise()
+        else rejectPromise(new Error(stderr || `yt-dlp 退出码 ${code}`))
+      })
+    })
+
+    // 找到下载好的文件
+    const files = fs.readdirSync(tmpDir)
+    const file = files.find(f => f.startsWith('output.'))
+    if (!file) {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+      return res.status(400).json({ code: -1, message: '无水印下载失败，未生成文件' })
+    }
+    const filePath = path.join(tmpDir, file)
+
+    // 生成下载文件名
+    const base = givenTitle || 'video'
+    const safeBase = base.replace(/[\\/:*?"<>|\r\n]+/g, '_').substring(0, 120)
+    const ext = path.extname(file) || '.mp4'
+    const downloadName = `${safeBase}_无水印${ext}`
+
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(downloadName)}`)
+    const stat = fs.statSync(filePath)
+    res.setHeader('Content-Length', stat.size)
+    res.setHeader('Content-Type', 'application/octet-stream')
+
+    const readStream = fs.createReadStream(filePath)
+    readStream.on('end', () => {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    })
+    readStream.on('error', (err) => {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+      console.error('[no-watermark download stream error]', err.message)
+      if (!res.headersSent) res.status(500).json({ code: -1, message: '文件读取失败' })
+    })
+    readStream.pipe(res)
+  } catch (err) {
+    console.error('[no-watermark download error]', (err.stderr || err.message || '').substring(0, 500))
+    return res.status(400).json({
+      code: -1,
+      message: '无水印下载失败，可能该视频不支持去水印',
+      detail: (err.message || '').substring(0, 300)
+    })
+  }
+})
+
 // ==================== B站 二维码登录 ====================
 
 /**
@@ -1732,9 +1863,10 @@ router.get('/ytdlp/bili-qrcode/status', async (req, res) => {
               'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
               'Referer': 'https://www.bilibili.com/',
               'Cookie': cookieContent.split('\n')
+                .map(line => line.replace(/^#HttpOnly_/, ''))
                 .filter(line => line && !line.startsWith('#') && line.includes('\t'))
                 .map(line => {
-                  const parts = line.replace(/^#HttpOnly_/, '').split('\t')
+                  const parts = line.split('\t')
                   if (parts.length >= 7) return `${parts[5]}=${parts[6]}`
                   return ''
                 })
@@ -1798,9 +1930,10 @@ router.get('/ytdlp/cookies/:platform', async (req, res) => {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           'Referer': 'https://www.bilibili.com/',
           'Cookie': cookieContent.split('\n')
+            .map(line => line.replace(/^#HttpOnly_/, ''))
             .filter(line => line && !line.startsWith('#') && line.includes('\t'))
             .map(line => {
-              const parts = line.replace(/^#HttpOnly_/, '').split('\t')
+              const parts = line.split('\t')
               if (parts.length >= 7) return `${parts[5]}=${parts[6]}`
               return ''
             })
