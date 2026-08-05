@@ -1066,6 +1066,131 @@ function getCookieFileForUrl(url) {
   return cookieFile || null
 }
 
+// 标准化视频 URL：将某些平台的非标准分享链接转为 yt-dlp 可识别的格式
+// 返回 null 表示该链接不是有效的视频链接（如搜索页、列表页等）
+function normalizeVideoUrl(url) {
+  if (!url) return url
+  try {
+    const urlObj = new URL(url)
+
+    // 抖音：/jingxuan/music?modal_id=XXX 或 /user/XXX?modal_id=YYY → /video/{modal_id}
+    if ((urlObj.hostname.includes('douyin.com') || urlObj.hostname.includes('iesdouyin.com'))
+        && urlObj.searchParams.has('modal_id')
+        && !urlObj.pathname.startsWith('/video/')) {
+      const modalId = urlObj.searchParams.get('modal_id')
+      if (modalId) {
+        console.log(`[url normalize] 抖音分享链接 → https://www.douyin.com/video/${modalId}`)
+        return `https://www.douyin.com/video/${modalId}`
+      }
+    }
+
+    // 快手 / 抖音搜索页、分类页、发现页 → 非视频链接
+    const nonVideoPaths = ['/search/', '/discover', '/explore', '/category/', '/tag/', '/topic/']
+    const isNonVideo = nonVideoPaths.some(p => urlObj.pathname.startsWith(p))
+    const isKwaiOrDouyin = urlObj.hostname.includes('kuaishou.com') ||
+      urlObj.hostname.includes('douyin.com') || urlObj.hostname.includes('iesdouyin.com')
+    if (isKwaiOrDouyin && isNonVideo) {
+      console.log(`[url normalize] 非视频链接被拒绝: ${url}`)
+      return null
+    }
+  } catch { /* URL 解析失败则不转换 */ }
+  return url
+}
+
+// ==================== 好看视频自定义提取 ====================
+// yt-dlp 不支持 haokan.baidu.com，通过解析页面 __PRELOADED_STATE__ 获取视频信息
+
+function isHaokanUrl(url) {
+  try {
+    const u = new URL(url)
+    return u.hostname.includes('haokan.baidu.com')
+  } catch { return false }
+}
+
+/**
+ * 解析"分:秒"格式的时长字符串为秒数
+ */
+function parseHaokanDuration(str) {
+  if (!str || typeof str !== 'string') return 0
+  const parts = str.split(':')
+  if (parts.length === 2) return parseInt(parts[0]) * 60 + parseInt(parts[1])
+  if (parts.length === 3) return parseInt(parts[0]) * 3600 + parseInt(parts[1]) * 60 + parseInt(parts[2])
+  return parseInt(str) || 0
+}
+
+/**
+ * 从好看视频页面提取视频信息
+ * 返回 null 或 { title, thumbnail, duration, uploader, formats, ... }
+ */
+async function extractHaokanVideo(videoUrl) {
+  const resp = await axios.get(videoUrl, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Referer': 'https://haokan.baidu.com/',
+      'Accept-Language': 'zh-CN,zh;q=0.9'
+    },
+    timeout: 15000,
+    httpsAgent: insecureAgent
+  })
+  const html = resp.data
+
+  // 提取 window.__PRELOADED_STATE__
+  const stateMatch = html.match(/window\.__PRELOADED_STATE__\s*=\s*(\{[\s\S]*?\});/)
+  if (!stateMatch) {
+    console.log('[haokan extract] 页面中未找到 __PRELOADED_STATE__')
+    return null
+  }
+
+  let state
+  try { state = JSON.parse(stateMatch[1]) } catch (e) {
+    console.log('[haokan extract] JSON 解析失败:', e.message)
+    return null
+  }
+
+  // 查找当前视频数据：优先 curVideoMeta，否则从 curVideoRelate 中按 vid 匹配
+  let videoData = state.curVideoMeta
+  if (!videoData || !videoData.playurl) {
+    const vidMatch = videoUrl.match(/[?&]vid=(\d+)/)
+    const targetVid = vidMatch ? vidMatch[1] : null
+    const relateList = state.curVideoRelate || []
+    videoData = relateList.find(v => String(v.vid || v.id) === targetVid) || relateList[0]
+  }
+  if (!videoData || !videoData.playurl) {
+    console.log('[haokan extract] 未找到有效的视频数据')
+    return null
+  }
+
+  const title = videoData.title || ''
+  const playUrl = videoData.playurl
+  console.log(`[haokan extract] 成功: "${title.substring(0, 40)}"`)
+
+  return {
+    id: videoData.vid || videoData.id || '',
+    title: title,
+    fulltitle: title,
+    thumbnail: videoData.poster_big || videoData.poster || '',
+    description: videoData.description || videoData.desc || '',
+    duration: parseHaokanDuration(videoData.duration),
+    uploader: videoData.author || videoData.author_name || videoData.source || '',
+    webpageUrl: videoUrl,
+    extractor: 'haokan-custom',
+    formats: [{
+      formatId: '0',
+      ext: 'mp4',
+      resolution: '',
+      height: videoData.height || 720,
+      width: videoData.width || 1280,
+      filesize: videoData.filesize || null,
+      tbr: null,
+      vcodec: 'h264',
+      acodec: 'aac',
+      formatNote: '默认',
+      protocol: 'https',
+      url: playUrl
+    }]
+  }
+}
+
 // 将 B站 Set-Cookie 数组转换为 Netscape 格式 cookie 文件并保存
 function saveBilibiliCookie(setCookieArr) {
   if (!Array.isArray(setCookieArr) || setCookieArr.length === 0) return false
@@ -1208,9 +1333,22 @@ router.post('/ytdlp/extract', async (req, res, next) => {
       })
     }
 
-    const { url: videoUrl } = req.body
+    let { url: videoUrl } = req.body
     if (!videoUrl) {
       return res.status(400).json({ code: -1, message: '缺少视频链接' })
+    }
+    videoUrl = normalizeVideoUrl(videoUrl)
+    if (!videoUrl) {
+      return res.status(400).json({ code: -1, message: '请使用具体视频的链接，当前链接可能为搜索页或列表页' })
+    }
+
+    // 好看视频：yt-dlp 不支持，使用页面解析
+    if (isHaokanUrl(videoUrl)) {
+      const haokanData = await extractHaokanVideo(videoUrl)
+      if (haokanData) {
+        return res.json({ code: 0, data: haokanData })
+      }
+      // 页面解析失败则继续走 yt-dlp（保底）
     }
 
     // -j: 输出 JSON 信息
@@ -1287,9 +1425,30 @@ router.post('/ytdlp/stream-url', async (req, res, next) => {
       })
     }
 
-    const { url: videoUrl, formatId } = req.body
+    let { url: videoUrl, formatId } = req.body
     if (!videoUrl) {
       return res.status(400).json({ code: -1, message: '缺少视频链接' })
+    }
+    videoUrl = normalizeVideoUrl(videoUrl)
+    if (!videoUrl) {
+      return res.status(400).json({ code: -1, message: '请使用具体视频的链接，当前链接可能为搜索页或列表页' })
+    }
+
+    // 好看视频：直接返回页面解析出的 playurl
+    if (isHaokanUrl(videoUrl)) {
+      const haokanData = await extractHaokanVideo(videoUrl)
+      if (haokanData && haokanData.formats && haokanData.formats[0] && haokanData.formats[0].url) {
+        return res.json({
+          code: 0,
+          data: {
+            url: haokanData.formats[0].url,
+            formatId: '0',
+            ext: 'mp4',
+            protocol: 'https',
+            title: haokanData.title
+          }
+        })
+      }
     }
 
     // -g: 获取直接流地址（不下载）
@@ -1417,9 +1576,13 @@ router.post('/ytdlp/audio-stream', async (req, res, next) => {
       })
     }
 
-    const { url: videoUrl } = req.body
+    let { url: videoUrl } = req.body
     if (!videoUrl) {
       return res.status(400).json({ code: -1, message: '缺少视频链接' })
+    }
+    videoUrl = normalizeVideoUrl(videoUrl)
+    if (!videoUrl) {
+      return res.status(400).json({ code: -1, message: '请使用具体视频的链接，当前链接可能为搜索页或列表页' })
     }
 
     // ========== 缓存检查 ==========
@@ -1543,12 +1706,53 @@ router.post('/ytdlp/audio-stream', async (req, res, next) => {
  */
 router.post('/ytdlp/download', async (req, res, next) => {
   try {
-    if (!ytDlpAvailable) {
-      return res.status(503).json({ code: -1, message: 'yt-dlp 未安装或不可用' })
-    }
-    const { url: videoUrl, formatId, audioOnly, title: givenTitle } = req.body
+    let { url: videoUrl, formatId, audioOnly, title: givenTitle } = req.body
     if (!videoUrl) {
       return res.status(400).json({ code: -1, message: '缺少视频链接' })
+    }
+    videoUrl = normalizeVideoUrl(videoUrl)
+    if (!videoUrl) {
+      return res.status(400).json({ code: -1, message: '请使用具体视频的链接，当前链接可能为搜索页或列表页' })
+    }
+
+    // 好看视频自定义下载（不依赖 yt-dlp，直接从 CDN 流式转发）
+    if (isHaokanUrl(videoUrl) && !audioOnly) {
+      const haokanData = await extractHaokanVideo(videoUrl)
+      if (!haokanData || !haokanData.formats || !haokanData.formats[0] || !haokanData.formats[0].url) {
+        return res.status(400).json({ code: -1, message: '提取好看视频信息失败' })
+      }
+      const playUrl = haokanData.formats[0].url
+      const title = givenTitle || haokanData.title || 'video'
+      const safeBase = title.replace(/[\\/:*?"<>|\r\n]+/g, '_').substring(0, 120)
+      const downloadName = `${safeBase}.mp4`
+
+      const streamResp = await axios({
+        method: 'get',
+        url: playUrl,
+        responseType: 'stream',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Referer': 'https://haokan.baidu.com/'
+        },
+        timeout: 120000,
+        httpsAgent: insecureAgent
+      })
+
+      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(downloadName)}`)
+      res.setHeader('Content-Type', 'application/octet-stream')
+      if (streamResp.headers['content-length']) {
+        res.setHeader('Content-Length', streamResp.headers['content-length'])
+      }
+      streamResp.data.pipe(res)
+      streamResp.data.on('error', (err) => {
+        console.error('[haokan download stream error]', err.message)
+        if (!res.headersSent) res.status(500).json({ code: -1, message: '下载中断' })
+      })
+      return
+    }
+
+    if (!ytDlpAvailable) {
+      return res.status(503).json({ code: -1, message: 'yt-dlp 未安装或不可用' })
     }
 
     // 创建临时目录用于下载
@@ -1568,8 +1772,11 @@ router.post('/ytdlp/download', async (req, res, next) => {
       // 转音频：提取最佳音频并转 MP3（需要 ffmpeg，yt-dlp 会自动调用）
       args.push('-f', 'bestaudio/best', '-x', '--audio-format', 'mp3', '--audio-quality', '0')
     } else {
-      // 下载视频：默认最佳画质
-      args.push('-f', formatId || 'best')
+      // 下载视频：不指定 -f 时让 yt-dlp 自动选择并合并最佳格式
+      // -f best 对 B站等平台不适用，yt-dlp 会自动选 bestvideo+bestaudio 并合并
+      if (formatId) {
+        args.push('-f', formatId)
+      }
     }
     args.push(videoUrl)
 
@@ -1640,12 +1847,53 @@ router.post('/ytdlp/download', async (req, res, next) => {
  */
 router.post('/ytdlp/no-watermark-download', async (req, res, next) => {
   try {
-    if (!ytDlpAvailable) {
-      return res.status(503).json({ code: -1, message: 'yt-dlp 未安装或不可用' })
-    }
-    const { url: videoUrl, title: givenTitle } = req.body
+    let { url: videoUrl, title: givenTitle } = req.body
     if (!videoUrl) {
       return res.status(400).json({ code: -1, message: '缺少视频链接' })
+    }
+    videoUrl = normalizeVideoUrl(videoUrl)
+    if (!videoUrl) {
+      return res.status(400).json({ code: -1, message: '请使用具体视频的链接，当前链接可能为搜索页或列表页' })
+    }
+
+    // 好看视频无水印下载（好看视频无水印问题，直接转发 CDN）
+    if (isHaokanUrl(videoUrl)) {
+      const haokanData = await extractHaokanVideo(videoUrl)
+      if (!haokanData || !haokanData.formats || !haokanData.formats[0] || !haokanData.formats[0].url) {
+        return res.status(400).json({ code: -1, message: '提取好看视频信息失败' })
+      }
+      const playUrl = haokanData.formats[0].url
+      const title = givenTitle || haokanData.title || 'video'
+      const safeBase = title.replace(/[\\/:*?"<>|\r\n]+/g, '_').substring(0, 120)
+      const downloadName = `${safeBase}.mp4`
+
+      const streamResp = await axios({
+        method: 'get',
+        url: playUrl,
+        responseType: 'stream',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Referer': 'https://haokan.baidu.com/'
+        },
+        timeout: 120000,
+        httpsAgent: insecureAgent
+      })
+
+      res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(downloadName)}`)
+      res.setHeader('Content-Type', 'application/octet-stream')
+      if (streamResp.headers['content-length']) {
+        res.setHeader('Content-Length', streamResp.headers['content-length'])
+      }
+      streamResp.data.pipe(res)
+      streamResp.data.on('error', (err) => {
+        console.error('[haokan no-wm download stream error]', err.message)
+        if (!res.headersSent) res.status(500).json({ code: -1, message: '下载中断' })
+      })
+      return
+    }
+
+    if (!ytDlpAvailable) {
+      return res.status(503).json({ code: -1, message: 'yt-dlp 未安装或不可用' })
     }
 
     // Step 1: dump-json 获取所有格式
