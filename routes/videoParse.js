@@ -2,7 +2,10 @@ import { Router } from 'express'
 import axios from 'axios'
 import crypto from 'crypto'
 import https from 'https'
-import { execFile, exec } from 'child_process'
+import fs from 'fs'
+import path from 'path'
+import os from 'os'
+import { execFile, exec, spawn } from 'child_process'
 import { promisify } from 'util'
 import HttpsProxyAgent from 'https-proxy-agent'
 import { SocksProxyAgent } from 'socks-proxy-agent'
@@ -1037,6 +1040,82 @@ router.get('/auto', async (req, res, next) => {
 const { binPath, timeout, cookieFile, proxy, verbose } = config.ytDlp || {}
 const searchTimeout = Math.min(timeout || 60000, 30000) // 搜索最多等 30 秒
 
+// 按平台 Cookie 管理：cookies 目录 + 各平台文件
+const COOKIES_DIR = path.join(path.dirname(new URL(import.meta.url).pathname).replace(/^\/([A-Za-z]:)/, '$1'), '../cookies')
+const PLATFORM_COOKIE_MAP = {
+  douyin: 'douyin.txt',
+  kuaishou: 'kuaishou.txt',
+  bilibili: 'bilibili.txt'
+}
+// 确保 cookies 目录存在
+try {
+  fs.mkdirSync(COOKIES_DIR, { recursive: true })
+} catch { /* ignore */ }
+
+// 根据 URL 判断所属平台并返回对应 cookie 文件路径（不存在则回退到全局 cookieFile）
+function getCookieFileForUrl(url) {
+  const u = (url || '').toLowerCase()
+  let platform = null
+  if (u.includes('douyin.com') || u.includes('iesdouyin.com')) platform = 'douyin'
+  else if (u.includes('kuaishou.com') || u.includes('gifshow.com')) platform = 'kuaishou'
+  else if (u.includes('bilibili.com') || u.includes('b23.tv') || u.includes('bilibili.tv')) platform = 'bilibili'
+  if (platform) {
+    const p = path.join(COOKIES_DIR, PLATFORM_COOKIE_MAP[platform])
+    if (fs.existsSync(p)) return p
+  }
+  return cookieFile || null
+}
+
+// 将 B站 Set-Cookie 数组转换为 Netscape 格式 cookie 文件并保存
+function saveBilibiliCookie(setCookieArr) {
+  if (!Array.isArray(setCookieArr) || setCookieArr.length === 0) return false
+  let lines = ['# Netscape HTTP Cookie File', '# This file is managed by PersonalStaticStation backend. Do not edit by hand.', '']
+  for (const raw of setCookieArr) {
+    if (typeof raw !== 'string' || !raw) continue
+    // 解析 Set-Cookie: name=value; Domain=x; Path=y; Expires=z; HttpOnly; Secure
+    const [cookiePart, ...attrParts] = raw.split(';')
+    const eqIdx = cookiePart.indexOf('=')
+    if (eqIdx <= 0) continue
+    const name = cookiePart.slice(0, eqIdx).trim()
+    const value = cookiePart.slice(eqIdx + 1).trim()
+    let domain = ''
+    let pathVal = '/'
+    let expires = 0
+    let httpOnly = false
+    let secure = false
+    for (const attr of attrParts) {
+      const a = attr.trim()
+      const lower = a.toLowerCase()
+      const [k, ...v] = a.split('=')
+      if (lower === 'httponly') httpOnly = true
+      else if (lower === 'secure') secure = true
+      else if (k.toLowerCase() === 'domain') domain = v.join('=').trim()
+      else if (k.toLowerCase() === 'path') pathVal = v.join('=').trim()
+      else if (k.toLowerCase() === 'expires') {
+        const t = Date.parse(v.join('='))
+        if (!isNaN(t)) expires = Math.floor(t / 1000)
+      }
+    }
+    // 默认域名为 bilibili.com（如果未指定）
+    if (!domain) domain = '.bilibili.com'
+    if (!domain.startsWith('.')) domain = '.' + domain
+    // 过期时间默认为会话末尾（30天），避免立即失效
+    if (!expires) expires = Math.floor(Date.now() / 1000) + 30 * 24 * 3600
+    const includeSub = 'TRUE'
+    const flag = secure ? 'TRUE' : 'FALSE'
+    const httpOnlyPrefix = httpOnly ? '#HttpOnly_' : ''
+    lines.push(`${httpOnlyPrefix}${domain}\t${includeSub}\t${pathVal}\t${flag}\t${expires}\t${name}\t${value}`)
+  }
+  const filePath = path.join(COOKIES_DIR, 'bilibili.txt')
+  try {
+    fs.writeFileSync(filePath, lines.join('\n'), 'utf8')
+    return true
+  } catch (err) {
+    console.error('[bili-qrcode] 保存 cookie 失败:', err.message)
+    return false
+  }
+}
+
 // 全局状态：yt-dlp 是否可用
 let ytDlpVersion = null
 let ytDlpAvailable = false
@@ -1068,13 +1147,15 @@ checkYtDlp()
 /**
  * 执行 yt-dlp 命令，统一处理超时和错误
  */
-async function runYtDlp(args, maxTimeout = timeout) {
+async function runYtDlp(args, maxTimeout = timeout, url = '') {
   const finalArgs = [...args]
   if (proxy) {
     finalArgs.unshift('--proxy', proxy)
   }
-  if (cookieFile) {
-    finalArgs.unshift('--cookies', cookieFile)
+  // 按平台使用 cookie（优先对应平台的 cookie 文件，回退全局 cookieFile）
+  const effectiveCookie = url ? getCookieFileForUrl(url) : cookieFile
+  if (effectiveCookie) {
+    finalArgs.unshift('--cookies', effectiveCookie)
   }
   if (verbose) {
     console.log(`[yt-dlp] ${binPath} ${finalArgs.join(' ')}`)
@@ -1140,7 +1221,7 @@ router.post('/ytdlp/extract', async (req, res, next) => {
       '--no-playlist',
       '--no-check-certificate',
       videoUrl
-    ], timeout)
+    ], timeout, videoUrl)
 
     const info = JSON.parse(stdout)
 
@@ -1222,7 +1303,7 @@ router.post('/ytdlp/stream-url', async (req, res, next) => {
     if (formatId) {
       args.unshift('-f', formatId)
     }
-    const { stdout } = await runYtDlp(args, timeout)
+    const { stdout } = await runYtDlp(args, timeout, videoUrl)
 
     // yt-dlp -g 输出可能是多行（video + audio 分开时），取第一行视频流
     const lines = stdout.split('\n').filter(Boolean)
@@ -1365,7 +1446,7 @@ router.post('/ytdlp/audio-stream', async (req, res, next) => {
     try {
       const { stdout } = await runYtDlp([
         '-j', '--no-playlist', '--no-check-certificate', videoUrl
-      ], timeout)
+      ], timeout, videoUrl)
       const info = JSON.parse(stdout)
       title = info.title || ''
       duration = info.duration || 0
@@ -1384,7 +1465,7 @@ router.post('/ytdlp/audio-stream', async (req, res, next) => {
       '--no-playlist',
       '--no-check-certificate',
       videoUrl
-    ], timeout)
+    ], timeout, videoUrl)
 
     const audioStreamUrl = stdout.split('\n').filter(Boolean)[0]
     if (!audioStreamUrl || !audioStreamUrl.startsWith('http')) {
@@ -1446,6 +1527,297 @@ router.post('/ytdlp/audio-stream', async (req, res, next) => {
       })
     }
     next(err)
+  }
+})
+
+// ==================== 视频下载 / 音频转换端点 ====================
+
+/**
+ * POST /video-parse/ytdlp/download
+ * 用 yt-dlp 下载视频（或转音频 MP3）并回传给浏览器
+ * Body: { url, formatId?, audioOnly?, title? }
+ *   - url: 视频链接
+ *   - formatId: 可选，指定格式ID（如 best、bestvideo+bestaudio），默认 best
+ *   - audioOnly: 若为 true，则提取为 MP3 音频（等价转音频功能）
+ *   - title: 可选，用于设置下载文件名
+ */
+router.post('/ytdlp/download', async (req, res, next) => {
+  try {
+    if (!ytDlpAvailable) {
+      return res.status(503).json({ code: -1, message: 'yt-dlp 未安装或不可用' })
+    }
+    const { url: videoUrl, formatId, audioOnly, title: givenTitle } = req.body
+    if (!videoUrl) {
+      return res.status(400).json({ code: -1, message: '缺少视频链接' })
+    }
+
+    // 创建临时目录用于下载
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ytdlp-'))
+    const outTemplate = path.join(tmpDir, 'output.%(ext)s')
+    const audioOutTemplate = path.join(tmpDir, 'output.%(ext)s')
+
+    const args = [
+      '--no-playlist',
+      '--no-check-certificate',
+      '-o', audioOnly ? audioOutTemplate : outTemplate
+    ]
+    if (proxy) args.push('--proxy', proxy)
+    if (cookieFile) args.push('--cookies', cookieFile)
+
+    if (audioOnly) {
+      // 转音频：提取最佳音频并转 MP3（需要 ffmpeg，yt-dlp 会自动调用）
+      args.push('-f', 'bestaudio/best', '-x', '--audio-format', 'mp3', '--audio-quality', '0')
+    } else {
+      // 下载视频：默认最佳画质
+      args.push('-f', formatId || 'best')
+    }
+    args.push(videoUrl)
+
+    // 使用 spawn 执行，避免 exec 内存 buffer 限制
+    // 使用完整命令字符串（yt-dlp 路径可能含空格）
+    const cmd = `"${binPath}" ${args.map(a => `"${a}"`).join(' ')}`
+    await new Promise((resolvePromise, rejectPromise) => {
+      const proc = spawn(cmd, { shell: true, windowsHide: true })
+      let stderr = ''
+      proc.stderr.on('data', d => { stderr += d.toString() })
+      proc.on('error', err => rejectPromise(err))
+      proc.on('close', code => {
+        if (code === 0) resolvePromise()
+        else rejectPromise(new Error(stderr || `yt-dlp 退出码 ${code}`))
+      })
+    })
+
+    // 找到下载好的文件
+    const files = fs.readdirSync(tmpDir)
+    const file = files.find(f => f.startsWith('output.'))
+    if (!file) {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+      return res.status(400).json({ code: -1, message: '下载失败，未生成文件' })
+    }
+    const filePath = path.join(tmpDir, file)
+
+    // 生成下载文件名（去除非法字符）
+    const base = givenTitle || 'video'
+    const safeBase = base.replace(/[\\/:*?"<>|\r\n]+/g, '_').substring(0, 120)
+    const ext = path.extname(file) || (audioOnly ? '.mp3' : '.mp4')
+    const downloadName = `${safeBase}${ext}`
+
+    // 流式回传文件，触发浏览器下载
+    res.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(downloadName)}`)
+    const stat = fs.statSync(filePath)
+    res.setHeader('Content-Length', stat.size)
+    const contentType = audioOnly ? 'audio/mpeg' : 'application/octet-stream'
+    res.setHeader('Content-Type', contentType)
+
+    const readStream = fs.createReadStream(filePath)
+    readStream.on('end', () => {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+    })
+    readStream.on('error', (err) => {
+      fs.rmSync(tmpDir, { recursive: true, force: true })
+      console.error('[yt-dlp download stream error]', err.message)
+      if (!res.headersSent) res.status(500).json({ code: -1, message: '文件读取失败' })
+    })
+    readStream.pipe(res)
+  } catch (err) {
+    console.error('[yt-dlp download error]', (err.stderr || err.message || '').substring(0, 500))
+    return res.status(400).json({
+      code: -1,
+      message: '下载失败，可能是链接无效或平台不支持',
+      detail: (err.message || '').substring(0, 300)
+    })
+  }
+})
+
+// ==================== B站 二维码登录 ====================
+
+/**
+ * POST /video-parse/ytdlp/bili-qrcode
+ * 获取 B站扫码登录二维码
+ * 返回: { code, data: { url, qrcodeKey, expiresIn } }
+ */
+router.post('/ytdlp/bili-qrcode', async (req, res) => {
+  try {
+    const resp = await axios.get(
+      'https://passport.bilibili.com/x/passport-login/web/qrcode/generate',
+      {
+        params: { source: 'main-fe-header' },
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Referer': 'https://www.bilibili.com/'
+        },
+        timeout: 15000
+      }
+    )
+    const data = resp.data?.data
+    if (!data?.url || !data?.qrcode_key) {
+      return res.json({ code: -1, message: '获取二维码失败，请重试' })
+    }
+    res.json({
+      code: 0,
+      data: {
+        url: data.url,
+        qrcodeKey: data.qrcode_key,
+        expiresIn: data.qrcode_expires_in || 180
+      }
+    })
+  } catch (err) {
+    const detail = err.response?.data ? JSON.stringify(err.response.data).substring(0, 200) : (err.code || err.message)
+    console.error('[bili-qrcode] 生成二维码失败:', detail)
+    res.json({
+      code: -1,
+      message: '生成二维码失败，请检查服务器网络',
+      detail: err.response?.status ? `B站接口返回 ${err.response.status}` : (err.code || '网络不通')
+    })
+  }
+})
+
+/**
+ * GET /video-parse/ytdlp/bili-qrcode/status?qrcodeKey=xxx
+ * 轮询扫码状态，扫码成功后自动保存 cookie
+ * status: 0=pending 1=scanned 2=success -1=expired
+ */
+router.get('/ytdlp/bili-qrcode/status', async (req, res) => {
+  const { qrcodeKey } = req.query
+  if (!qrcodeKey) {
+    return res.status(400).json({ code: -1, message: '缺少 qrcodeKey' })
+  }
+  try {
+    const resp = await axios.get(
+      'https://passport.bilibili.com/x/passport-login/web/qrcode/poll',
+      {
+        params: { qrcode_key: qrcodeKey },
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        },
+        timeout: 15000
+      }
+    )
+    const data = resp.data?.data
+    const code = data?.code
+    // B站 poll 返回: code=0 成功(附带 url 和 cookies), code=86038 已扫码, code=86090 未扫码
+    if (code === 0 && data?.url) {
+      // 登录成功，保存 cookie
+      // poll 接口的 Set-Cookie 不完整，需要再请求 data.url 获取完整登录 cookie
+      let setCookies = resp.headers['set-cookie'] || []
+      try {
+        const redirectResp = await axios.get(data.url, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.bilibili.com/'
+          },
+          maxRedirects: 5,
+          timeout: 15000
+        })
+        // 合并 poll 响应和重定向响应的 Set-Cookie
+        const redirectCookies = redirectResp.headers['set-cookie'] || []
+        // 去重：同名 cookie 以后者为准
+        const cookieMap = new Map()
+        for (const c of [...setCookies, ...redirectCookies]) {
+          const name = c.split('=')[0]
+          cookieMap.set(name, c)
+        }
+        setCookies = Array.from(cookieMap.values())
+      } catch (redirectErr) {
+        console.error('[bili-qrcode] 获取重定向 cookie 失败（降级使用 poll 的 Set-Cookie）:', redirectErr.message)
+      }
+      const saved = saveBilibiliCookie(setCookies)
+      if (saved) {
+        // 立即验证 cookie 是否有效，获取昵称一起返回
+        try {
+          const cookieFile = path.join(COOKIES_DIR, 'bilibili.txt')
+          const cookieContent = fs.readFileSync(cookieFile, 'utf8')
+          const verifyResp = await axios.get('https://api.bilibili.com/x/web-interface/nav', {
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              'Referer': 'https://www.bilibili.com/',
+              'Cookie': cookieContent.split('\n')
+                .filter(line => line && !line.startsWith('#') && line.includes('\t'))
+                .map(line => {
+                  const parts = line.replace(/^#HttpOnly_/, '').split('\t')
+                  if (parts.length >= 7) return `${parts[5]}=${parts[6]}`
+                  return ''
+                })
+                .filter(Boolean).join('; ')
+            },
+            timeout: 10000
+          })
+          const nickname = verifyResp.data?.data?.uname || ''
+          const isValid = verifyResp.data?.data?.isLogin === true
+          return res.json({
+            code: 0,
+            data: {
+              status: 'success',
+              saved: true,
+              nickname,
+              valid: isValid,
+              message: isValid ? `登录成功，欢迎 ${nickname}` : `Cookie 已保存但验证未通过${nickname ? '（' + nickname + '）' : ''}，请重试`
+            }
+          })
+        } catch (verifyErr) {
+          console.error('[bili-qrcode] 验证 cookie 失败:', verifyErr.message)
+        }
+      }
+      return res.json({
+        code: 0,
+        data: { status: 'success', saved, message: saved ? '登录成功，Cookie 已保存' : '登录成功，但保存 Cookie 失败' }
+      })
+    }
+    if (code === 86038) {
+      return res.json({ code: 0, data: { status: 'scanned', message: '已扫码，等待确认' } })
+    }
+    if (code === 86090 || code === 86101) {
+      return res.json({ code: 0, data: { status: 'pending', message: '等待扫码' } })
+    }
+    // 其他状态码视为过期或失败
+    return res.json({ code: 0, data: { status: 'expired', message: '二维码已过期，请重新获取' } })
+  } catch (err) {
+    console.error('[bili-qrcode] 轮询失败:', err.message)
+    res.json({ code: -1, message: '轮询登录状态失败，请重试' })
+  }
+})
+
+/**
+ * GET /video-parse/ytdlp/cookies/:platform
+ * 查询某平台是否已配置 cookie 文件，B站额外验证 cookie 有效性
+ */
+router.get('/ytdlp/cookies/:platform', async (req, res) => {
+  const platform = (req.params.platform || '').toLowerCase()
+  const file = PLATFORM_COOKIE_MAP[platform]
+  if (!file) return res.json({ code: 0, data: { configured: false } })
+  const p = path.join(COOKIES_DIR, file)
+  const configured = fs.existsSync(p) && fs.statSync(p).size > 0
+  if (!configured) return res.json({ code: 0, data: { configured: false } })
+
+  // B站额外验证 cookie 是否有效（调用 B站用户信息接口）
+  if (platform === 'bilibili') {
+    try {
+      const cookieContent = fs.readFileSync(p, 'utf8')
+      const resp = await axios.get('https://api.bilibili.com/x/web-interface/nav', {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Referer': 'https://www.bilibili.com/',
+          'Cookie': cookieContent.split('\n')
+            .filter(line => line && !line.startsWith('#') && line.includes('\t'))
+            .map(line => {
+              const parts = line.replace(/^#HttpOnly_/, '').split('\t')
+              if (parts.length >= 7) return `${parts[5]}=${parts[6]}`
+              return ''
+            })
+            .filter(Boolean)
+            .join('; ')
+        },
+        timeout: 10000
+      })
+      const valid = resp.data?.data?.isLogin === true
+      res.json({ code: 0, data: { configured: true, valid, nickname: valid ? (resp.data.data.uname || '') : '' } })
+    } catch (err) {
+      console.error('[bili-cookie-check] 验证失败:', err.message)
+      // 接口失败不判定为失效，保留文件存在状态
+      res.json({ code: 0, data: { configured: true, valid: null } })
+    }
+  } else {
+    res.json({ code: 0, data: { configured: true } })
   }
 })
 
@@ -1946,14 +2318,12 @@ router.post('/ytdlp/search', async (req, res, next) => {
     const searchTasks = []
 
     switch (searchPlatform) {
-      case 'youtube':
-        searchTasks.push({ label: 'YouTube', searchQuery: `ytsearch${maxLimit}:${trimmedQuery}` })
-        break
-      case 'bilibili_youtube':
-        // 用户明确要求双搜
-        searchTasks.push({ label: 'Bilibili', searchQuery: `bilisearch${maxLimit}:${trimmedQuery}` })
-        searchTasks.push({ label: 'YouTube', searchQuery: `ytsearch${maxLimit}:${trimmedQuery}` })
-        break
+      case 'douyin':
+      case 'kuaishou':
+      case 'haokan':
+      case 'weishi':
+        // 抖音/快手/好看/微视无名称搜索协议，返回空提示（前端已引导用户粘贴链接）
+        return res.json({ code: 0, data: { query: trimmedQuery, platform: searchPlatform, total: 0, groupCount: 0, results: [], groups: [], ungrouped: [] }, cached: false })
       case 'bilibili':
       default:
         searchTasks.push({ label: 'Bilibili', searchQuery: `bilisearch${maxLimit}:${trimmedQuery}` })
@@ -2060,7 +2430,7 @@ router.post('/ytdlp/playlist', async (req, res, next) => {
       '--playlist-end', String(maxVideos),
       '--no-check-certificate',
       pageUrl
-    ], timeout * 2) // 播放列表可能需要更长时间
+    ], timeout * 2, pageUrl) // 播放列表可能需要更长时间
 
     const lines = stdout.split('\n').filter(Boolean)
     const videos = lines.map(line => {
