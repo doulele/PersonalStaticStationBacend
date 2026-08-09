@@ -107,39 +107,65 @@ async function fetchSinaQuotes(_dateStr) {
 
 /**
  * 从东方财富获取ETF份额数据（备用 + 份额数据）
- * 使用 push2.eastmoney.com API
+ * 使用 stock/get 逐只串行查询（带重试），f49=总份额 f116=总净资产
+ * 如果东方财富不可用，降级为无份额数据
  */
 async function fetchEastMoneyShares() {
-  const secids = ETF_LIST.map(e => `1.${e.code}`).join(',')
-  // f48=总股本(份额), f116=总净资产, f117=单位净值, f43=最新价
-  const url = `https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&secids=${secids}&fields=f2,f3,f4,f5,f6,f7,f8,f9,f12,f14,f15,f16,f17,f18,f20,f21,f43,f44,f45,f46,f47,f48,f57,f58,f116,f117`
-  console.log(`[NT] 采集东方财富份额: ${secids}`)
-
-  const raw = await httpGet(url, {
-    timeout: 10000,
-    headers: { 'Referer': 'https://quote.eastmoney.com/' }
-  })
-  const json = JSON.parse(raw)
   const results = {}
+  const codes = ETF_LIST.map(e => e.code).join(',')
+  console.log(`[NT] 采集东方财富份额: ${codes}`)
 
-  if (json?.data?.diff) {
-    for (const item of json.data.diff) {
-      results[item.f12] = {
-        code: item.f12,
-        name: item.f14,
-        close_price: item.f2 != null ? parseFloat(item.f2) : null,
-        open_price: item.f17 != null ? parseFloat(item.f17) : null,
-        high_price: item.f15 != null ? parseFloat(item.f15) : null,
-        low_price: item.f16 != null ? parseFloat(item.f16) : null,
-        volume: item.f5 != null ? parseFloat(item.f5) : null,
-        amount: item.f6 != null ? parseFloat(item.f6) : null,
-        total_shares: item.f48 != null ? parseFloat(item.f48) : null,
-        total_nav: item.f116 != null ? parseFloat(item.f116) : null,
-        source: 'eastmoney'
+  for (const etf of ETF_LIST) {
+    let success = false
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const url = `https://push2.eastmoney.com/api/qt/stock/get?secid=1.${etf.code}&fields=f43,f44,f45,f46,f47,f48,f49,f116,f117`
+        const raw = await httpGet(url, {
+          timeout: 10000,
+          headers: { 'Referer': 'https://quote.eastmoney.com/' }
+        })
+        const json = JSON.parse(raw)
+        const d = json?.data
+        if (!d || d.f43 == null) {
+          if (attempt === 0) { await new Promise(r => setTimeout(r, 1000)); continue }
+          console.warn(`[NT] 东方财富 ${etf.code} 无数据`)
+          break
+        }
+
+        results[etf.code] = {
+          code: etf.code,
+          name: etf.name,
+          close_price: d.f43 != null ? d.f43 / 1000 : null,
+          open_price: d.f46 != null ? d.f46 / 1000 : null,
+          high_price: d.f44 != null ? d.f44 / 1000 : null,
+          low_price: d.f45 != null ? d.f45 / 1000 : null,
+          volume: d.f47 != null ? d.f47 : null,
+          amount: d.f48 != null ? d.f48 : null,
+          total_shares: d.f49 != null ? d.f49 : null,
+          total_nav: d.f116 != null ? d.f116 : null,
+          source: 'eastmoney'
+        }
+        success = true
+        break
+      } catch (err) {
+        if (attempt === 0) {
+          await new Promise(r => setTimeout(r, 1000))
+        } else {
+          console.warn(`[NT] 东方财富 ${etf.code} 查询失败:`, err.message)
+        }
       }
+    }
+    if (success) {
+      // 串行延迟避免限流
+      await new Promise(r => setTimeout(r, 500))
     }
   }
 
+  if (Object.keys(results).length === 0) {
+    console.warn('[NT] 东方财富份额数据全部获取失败，降级为无份额模式')
+  } else {
+    console.log(`[NT] 东方财富采集成功: ${Object.keys(results).length} 只ETF`)
+  }
   return results
 }
 
@@ -183,14 +209,14 @@ async function collectETFData(dateStr) {
     merged[etf.code] = {
       code: etf.code,
       name: etf.name,
-      close_price: sina.close_price || em.close_price || null,
-      open_price: sina.open_price || em.open_price || null,
-      high_price: sina.high_price || em.high_price || null,
-      low_price: sina.low_price || em.low_price || null,
-      volume: sina.volume || em.volume || null,
-      amount: sina.amount || em.amount || null,
-      total_shares: em.total_shares || null,
-      total_nav: em.total_nav || null,
+      close_price: sina.close_price ?? em.close_price ?? null,
+      open_price: sina.open_price ?? em.open_price ?? null,
+      high_price: sina.high_price ?? em.high_price ?? null,
+      low_price: sina.low_price ?? em.low_price ?? null,
+      volume: sina.volume ?? em.volume ?? null,
+      amount: sina.amount ?? em.amount ?? null,
+      total_shares: em.total_shares ?? null,
+      total_nav: em.total_nav ?? null,
       source: sourceUsed
     }
   }
@@ -201,19 +227,30 @@ async function collectETFData(dateStr) {
 // ==================== 信号计算 ====================
 
 /**
- * 计算份额净变化（需昨天数据对比）
+ * 计算份额/资金净变化（需昨天数据对比）
+ * 优先用真实 total_shares，降级用 amount（成交额）变化估算
  */
 function calcShareChange(code, today, yesterday) {
   const prev = yesterday?.[code]
-  if (!prev?.total_shares || !today?.total_shares) return { change: null, changePct: null, skip: false }
+  if (!prev) return { change: null, changePct: null, skip: false }
 
-  const change = today.total_shares - prev.total_shares
-  const changePct = prev.total_shares > 0 ? (change / prev.total_shares) * 100 : 0
+  // 优先使用真实份额数据
+  if (today?.total_shares && prev?.total_shares) {
+    const change = today.total_shares - prev.total_shares
+    const changePct = prev.total_shares > 0 ? (change / prev.total_shares) * 100 : 0
+    const skip = Math.abs(changePct) > 5
+    return { change, changePct, skip }
+  }
 
-  // 份额暴增过滤：单日份额增长 > 前一日份额 × 5%
-  const skip = Math.abs(changePct) > 5
+  // 降级：用成交额变化估算资金流向（amount 日间变化率）
+  if (today?.amount && prev?.amount && prev.amount > 0) {
+    const change = today.amount - prev.amount
+    const changePct = (change / prev.amount) * 100
+    const skip = Math.abs(changePct) > 100  // 成交额变化超过100%视为异常
+    return { change, changePct, skip }
+  }
 
-  return { change, changePct, skip }
+  return { change: null, changePct: null, skip: false }
 }
 
 /**
@@ -231,13 +268,18 @@ function calcVolumeFactor(todayAmount, historyAmounts) {
 }
 
 /**
- * 计算单日份额因子得分 (0-100)
- * 当日份额净增 ÷ 过去5日净增均值（均值为负取绝对值）
- * 净增为正得正分，净增≤0得0分
+ * 计算单日资金流向因子得分 (0-100)（原份额因子）
+ * 当日资金净变化 ÷ 过去5日净变化均值
+ * 净变化为正得正分，净变化≤0得0分
  */
-function calcShareFactor(todayChange, historyChanges) {
-  if (todayChange == null || historyChanges.length === 0) return 0
+function calcShareFactor(todayChange, historyChanges, volumeFactorScore = 0) {
+  if (todayChange == null) return 0
   if (todayChange <= 0) return 0
+
+  // 历史数据不足时，用量能因子估算（成交额暴增 ≈ 资金流入）
+  if (historyChanges.length === 0) {
+    return Math.round(volumeFactorScore * 0.6)
+  }
 
   const avgRaw = historyChanges.reduce((a, b) => a + b, 0) / historyChanges.length
   const avg = avgRaw < 0 ? Math.abs(avgRaw) : (avgRaw || 1)
@@ -443,7 +485,7 @@ export async function runDailyTask(dateStr) {
 
       // 三因子得分
       const vScore = calcVolumeFactor(today.amount, history.amounts)
-      const sScore = calcShareFactor(today.share_change, history.shareChanges)
+      const sScore = calcShareFactor(today.share_change, history.shareChanges, vScore)
       const dScore = calcDirectionFactor(etfPct, hs300Change)
 
       etfScores[code] = { volume: vScore, share: sScore, direction: dScore }
