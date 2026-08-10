@@ -2438,7 +2438,6 @@ router.get('/ytdlp/cookies/:platform', async (req, res) => {
       res.json({ code: 0, data: { configured: true, valid, nickname: valid ? (resp.data.data.uname || '') : '' } })
     } catch (err) {
       console.error('[bili-cookie-check] 验证失败:', err.message)
-      // 接口失败不判定为失效，保留文件存在状态
       res.json({ code: 0, data: { configured: true, valid: null } })
     }
   } else {
@@ -2897,7 +2896,7 @@ function isMediaQuery(query) {
 /**
  * 执行单次 yt-dlp 搜索，返回解析后的结果数组
  */
-async function doSearch(searchQuery, timeoutMs) {
+async function doSearch(searchQuery, timeoutMs, useCookie = true) {
   try {
     const isBili = searchQuery.startsWith('bilisearch')
     const args = [
@@ -2916,7 +2915,9 @@ async function doSearch(searchQuery, timeoutMs) {
       searchQuery
     ]
     // B站搜索传 B站 URL 让 runYtDlp 通过 getCookieFileForUrl 自动加载 cookies/bilibili.txt
-    const result = await runYtDlp(args, timeoutMs, isBili ? 'https://www.bilibili.com/' : '')
+    // 未登录网站时不使用 cookie
+    const biliCookieUrl = (isBili && useCookie) ? 'https://www.bilibili.com/' : ''
+    const result = await runYtDlp(args, timeoutMs, biliCookieUrl)
     const lines = (result.stdout || '').split('\n').filter(Boolean)
     return lines.map(line => {
       try {
@@ -2964,7 +2965,7 @@ router.post('/ytdlp/search', async (req, res, next) => {
       })
     }
 
-    const { query, platform = 'bilibili', limit = 10 } = req.body
+    const { query, platform = 'bilibili', limit = 10, useCookie = true } = req.body
     if (!query || !query.trim()) {
       return res.status(400).json({ code: -1, message: '缺少搜索关键词' })
     }
@@ -2999,7 +3000,7 @@ router.post('/ytdlp/search', async (req, res, next) => {
 
     // ========== 并行执行搜索 ==========
     const settled = await Promise.allSettled(
-      searchTasks.map(t => doSearch(t.searchQuery, searchTimeout))
+      searchTasks.map(t => doSearch(t.searchQuery, searchTimeout, useCookie))
     )
 
     // 合并去重
