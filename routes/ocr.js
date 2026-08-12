@@ -3,9 +3,13 @@ import axios from 'axios'
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import multer from 'multer'
 import { signTc3 } from '../services/tencentSigner.js'
 import { parseWithDeepSeek } from '../services/llmParser.js'
 import { parseLotteryFromOcrText } from '../services/ocrTextParser.js'
+import { parseTradeRecords } from '../services/tradeRecordParser.js'
+import { parseTradeRecordsWithAI } from '../services/tradeRecordAiParser.js'
+import { authRequired } from '../middlewares/auth.js'
 import config from '../config/index.js'
 
 const __filename = fileURLToPath(import.meta.url)
@@ -182,6 +186,98 @@ router.post('/recognize', async (req, res) => {
       message: `OCR 请求失败: ${err.message}`,
       data: null
     })
+  }
+})
+
+// ==================== 交易记录截图解析 ====================
+
+// multer 配置：内存存储，限制 10MB
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }
+})
+
+/**
+ * 解析交易记录截图
+ * POST /ocr/parse-trade-records
+ * Body (multipart/form-data): image (文件) + useAI (可选, true/false)
+ *
+ * 两种模式：
+ * 1. 默认（OCR）：腾讯云 OCR → 本地规则解析
+ * 2. AI模式（仅登录用户）：腾讯云 OCR → DeepSeek AI 解析
+ *
+ * 返回：{ code: 0, data: { records: [...], source: 'ocr'|'ai', ocrText: '...' } }
+ */
+router.post('/parse-trade-records', upload.single('image'), async (req, res) => {
+  try {
+    const file = req.file
+    const useAI = req.body.useAI === 'true' || req.body.useAI === true
+
+    if (!file) {
+      return res.json({ code: -1, message: '请上传截图文件', data: null })
+    }
+
+    if (!secretId || !secretKey) {
+      return res.json({ code: -1, message: 'OCR 服务未配置', data: null })
+    }
+
+    // AI 模式仅登录用户可用
+    if (useAI && !req.userId) {
+      return res.json({ code: -1, message: 'AI 识别需要登录，请先登录后再使用', data: null })
+    }
+
+    const base64Image = file.buffer.toString('base64')
+    console.log(`[ocr] 交易记录解析：${useAI ? 'AI模式' : 'OCR模式'}，图片 ${(file.size / 1024).toFixed(1)}KB，用户: ${req.userId || '未登录'}`)
+
+    // 步骤1: 腾讯云 OCR（两种模式都需要）
+    const ocrResult = await callTencentOCR(base64Image)
+    if (!ocrResult) {
+      return res.json({ code: -1, message: 'OCR 识别失败，请确认图片清晰度', data: null })
+    }
+    console.log(`[ocr] 交易记录 OCR 完成：${ocrResult.text.length} 字符，${ocrResult.rawDetections?.length || 0} 行`)
+
+    let records = []
+    let source = 'ocr'
+
+    // 步骤2: AI 模式
+    if (useAI) {
+      const deepseekKey = config.deepseekApiKey
+      if (deepseekKey) {
+        // 尝试 AI Vision 解析
+        const aiRecords = await parseTradeRecordsWithAI(base64Image, deepseekKey)
+        if (aiRecords.length > 0) {
+          records = aiRecords
+          source = 'ai'
+          console.log(`[ocr] AI 识别成功: ${records.length} 条记录`)
+        } else {
+          console.warn('[ocr] AI 识别失败或无结果，回退到 OCR 解析')
+        }
+      } else {
+        console.warn('[ocr] DeepSeek API Key 未配置，回退到 OCR 解析')
+      }
+    }
+
+    // 步骤2b: OCR 模式或 AI 回退 — 本地规则解析
+    if (records.length === 0) {
+      records = parseTradeRecords(ocrResult.text)
+      source = 'ocr'
+      console.log(`[ocr] OCR 解析: ${records.length} 条记录`)
+    }
+
+    res.json({
+      code: 0,
+      data: {
+        records,
+        source,
+        ocrText: ocrResult.text
+      },
+      message: records.length > 0
+        ? `识别到 ${records.length} 条交易记录（${source === 'ai' ? 'AI' : 'OCR'} 解析）`
+        : '未能识别到交易记录，请确认截图包含买入/卖出明细'
+    })
+  } catch (err) {
+    console.error('[ocr] parse-trade-records 异常:', err.message)
+    res.json({ code: -1, message: `解析失败: ${err.message}`, data: null })
   }
 })
 
