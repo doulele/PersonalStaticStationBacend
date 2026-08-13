@@ -19,6 +19,7 @@ import taskAlchemistRoutes from './taskAlchemist.js'
 import eternalArchiveRoutes from './eternalArchive.js'
 import recipeLabRoutes from './recipeLab.js'
 import nationalTeamRoutes from './nationalTeam.js'
+import stockRecommendRoutes from './stockRecommend.js'
 
 const router = Router()
 
@@ -52,6 +53,7 @@ router.use('/task-alchemist', taskAlchemistRoutes)
 router.use('/eternal-archive', eternalArchiveRoutes)
 router.use('/recipe-lab', recipeLabRoutes)
 router.use('/national-team', nationalTeamRoutes)
+router.use('/stock-recommend', stockRecommendRoutes)
 
 // 健康检查
 router.get('/health', (req, res) => {

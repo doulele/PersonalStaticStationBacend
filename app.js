@@ -71,6 +71,35 @@ async function startServer() {
   }, { timezone: 'Asia/Shanghai' })
   console.log('[NT Cron] 已注册定时任务：每天 23:30 (Asia/Shanghai)')
 
+  // ==================== 股票测评评分池预热 ====================
+  // 目的：避免用户首次访问时冷启动（需 30~90s 构建评分池）。
+  // 策略：服务启动后延迟预热三个周期；之后每 4 分钟检查缓存是否过期并重建。
+  // 通过共享内存缓存（stockScoreService 的 cacheGet/cacheSet）避免重复计算。
+  const { buildScorePool } = await import('./services/stockScoreService.js')
+  let prewarmLock = false
+
+  async function prewarmPools() {
+    if (prewarmLock) return
+    prewarmLock = true
+    try {
+      console.log('[StockRec] 评分池预热开始...')
+      for (const h of ['short', 'mid', 'long']) {
+        await buildScorePool(h, {}, 300)
+        console.log(`[StockRec] 预热完成: ${h}`)
+      }
+    } catch (err) {
+      console.error('[StockRec] 评分池预热失败:', err.message)
+    } finally {
+      prewarmLock = false
+    }
+  }
+
+  // 启动后 5 秒预热一次（避免阻塞服务启动）
+  setTimeout(prewarmPools, 5000)
+  // 每 4 分钟检查预热（评分池缓存 TTL 5 分钟，提前重建保证热缓存）
+  cron.schedule('*/4 * * * *', prewarmPools, { timezone: 'Asia/Shanghai' })
+  console.log('[StockRec] 已注册评分池预热：启动后延迟预热 + 每 4 分钟刷新')
+
   const server = createServer(app)
 
   process.on('SIGINT', () => {
