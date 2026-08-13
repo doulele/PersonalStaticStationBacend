@@ -96,9 +96,9 @@ async function startServer() {
 
   // 启动后 5 秒预热一次（避免阻塞服务启动）
   setTimeout(prewarmPools, 5000)
-  // 每 4 分钟检查预热（评分池缓存 TTL 5 分钟，提前重建保证热缓存）
-  cron.schedule('*/4 * * * *', prewarmPools, { timezone: 'Asia/Shanghai' })
-  console.log('[StockRec] 已注册评分池预热：启动后延迟预热 + 每 4 分钟刷新')
+  // 每 1 分钟检查预热（buildScorePool 内部有缓存判断，命中则跳过；配合智能 TTL 自动决定是否重建）
+  cron.schedule('* * * * *', prewarmPools, { timezone: 'Asia/Shanghai' })
+  console.log('[StockRec] 已注册评分池预热：启动后延迟预热 + 每 1 分钟检查（智能 TTL）')
 
   const server = createServer(app)
 

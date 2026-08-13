@@ -11,7 +11,7 @@
  * 缺失处理：子指标缺失→权重分摊；整维度缺失→维度权重按比例分摊到其他维度
  * 否决项：ST / 资产负债率>100% / 商誉>50% / 连续两年亏损且营收<1亿 → 强制"回避"
  */
-import { getMarketSnapshot, getFinData, getKline, getEnhanceData, pMap, isSt } from './stockDataService.js'
+import { getMarketSnapshot, getFinData, getKline, getEnhanceData, pMap, isSt, isTradingTime } from './stockDataService.js'
 import { cacheGet, cacheSet } from './cacheService.js'
 
 // ==================== 1. 周期配置 ====================
@@ -1052,7 +1052,8 @@ export async function buildScorePool(horizonKey = 'short', quickFilters = {}, po
       updateTime: new Date().toISOString()
     }
   }
-  cacheSet(cacheKey, result, 5 * 60_000)
+  // 评分池缓存 TTL 跟随行情敏感度：交易时段短缓存，非交易时段长缓存
+  cacheSet(cacheKey, result, isTradingTime() ? 2 * 60_000 : 30 * 60_000)
   return result
 }
 

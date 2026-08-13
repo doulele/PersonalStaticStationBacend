@@ -128,7 +128,30 @@ function normalizeStock(d) {
 }
 
 /**
- * 拉取全市场行情快照（分页拉取，串行，缓存 5min）
+ * 判断当前是否处于 A 股交易时段（9:30-11:30, 13:00-15:00，周一至周五）
+ * 用于智能缓存 TTL：交易时段行情持续变化用短缓存，非交易时段数据不变用长缓存。
+ */
+export function isTradingTime(now = new Date()) {
+  const day = now.getDay()
+  if (day === 0 || day === 6) return false // 周末
+  const h = now.getHours()
+  const m = now.getMinutes()
+  const t = h * 60 + m
+  return (t >= 9 * 60 + 30 && t <= 11 * 60 + 30) || (t >= 13 * 60 && t <= 15 * 60)
+}
+
+/**
+ * 行情快照智能缓存时长：
+ *   - 交易时段：2 分钟（盘中实时，价格持续变动）
+ *   - 非交易时段：60 分钟（收盘后价格不变，拉一次足够，避免无谓重建）
+ * 准确性无损：非交易时段数据本身不变化，长缓存不会产生"过期错误"。
+ */
+function marketTtlMs() {
+  return isTradingTime() ? 2 * 60_000 : 60 * 60_000
+}
+
+/**
+ * 拉取全市场行情快照（分页拉取，串行，智能缓存）
  * 注意：东财对单页 pz 有上限裁剪（实测当前 IP 最多 100 条/页），
  * 因此先用第一页探测实际 pageSize，再按 ceil(total/pageSize) 动态分页，保证拿满全市场。
  * 带完整性校验：拉到不足 total 的 90% 时整体重试一次；仍不足则不缓存（避免残缺数据被复用）。
@@ -165,7 +188,7 @@ export async function getMarketSnapshot() {
     console.warn(`[stockData] 快照仍不完整 ${stocks.length}/${total}，本次不缓存`)
     return stocks
   }
-  cacheSet('stockrec:market', stocks, 5 * 60_000)
+  cacheSet('stockrec:market', stocks, marketTtlMs())
   return stocks
 }
 
@@ -257,7 +280,7 @@ export async function getKline(code, days = 320) {
         volume: Array.isArray(r[5]) ? Number(r[5][0]) : Number(r[5])
       }))
       .filter(x => x.close > 0)
-    cacheSet(key, k, 5 * 60_000)
+    cacheSet(key, k, isTradingTime() ? 2 * 60_000 : 30 * 60_000)
     return k
   } catch {
     return []
