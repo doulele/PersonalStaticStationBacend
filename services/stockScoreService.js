@@ -19,6 +19,7 @@ import { cacheGet, cacheSet } from './cacheService.js'
 export const HORIZONS = {
   short: {
     key: 'short', label: '短线',
+    holdingPeriod: '1~2周',
     dimWeights: { valuation: 5, growth: 10, quality: 10, technical: 35, sentiment: 30, risk: 10 },
     techSubWeights: { trend: 30, momentum: 30, volatility: 15, volume: 15, pattern: 10 },
     rsiPeriod: 6,
@@ -26,6 +27,7 @@ export const HORIZONS = {
   },
   mid: {
     key: 'mid', label: '中长线',
+    holdingPeriod: '1~3个月',
     dimWeights: { valuation: 15, growth: 25, quality: 25, technical: 20, sentiment: 10, risk: 5 },
     techSubWeights: { trend: 35, momentum: 25, volatility: 15, volume: 15, pattern: 10 },
     rsiPeriod: 14,
@@ -33,6 +35,7 @@ export const HORIZONS = {
   },
   long: {
     key: 'long', label: '长线',
+    holdingPeriod: '6个月以上',
     dimWeights: { valuation: 30, growth: 20, quality: 30, technical: 10, sentiment: 5, risk: 5 },
     techSubWeights: { trend: 40, momentum: 20, volatility: 15, volume: 15, pattern: 10 },
     rsiPeriod: 24,
@@ -943,20 +946,177 @@ function stretchScore(total, range) {
 }
 
 /**
- * 构建"评分池"：全市场 → 快筛 → 基础分排序取池 → F10 → K线 → 完整评分
- * 结果缓存 5 分钟
+ * 构建"评分池"：SWR（Stale-While-Revalidate）两阶段模式
+ * ------------------------------------------------------------
+ * 阶段A（秒级）：全市场 → 快筛 → 基础分排序取池 → 立即返回基础列表
+ * 阶段B（分钟级）：后台对池内股票补 F10 + K线 → 完整六维评分 → 写缓存
+ * 接口行为：
+ *   - 完整池缓存命中 → 直接返回完整结果（meta.stage='full'）
+ *   - 未命中 → 先返回阶段A基础列表（meta.stage='base'），同时后台异步构建完整池；
+ *     前端轮询（或用户刷新）命中缓存后得到完整结果。
+ * 收益：接口从"等 1~2 分钟"变为"秒级出列表"，服务器不再让用户阻塞等待；
+ *       完整池构建失败也只影响 stage，不影响已返回的基础列表。
+ *
+ * 并发保护：
+ *   - 基础池单飞：同一筛选只构建一次
+ *   - 完整池全局串行：任何时刻最多 1 个完整池构建在跑（防多条件并发打爆数据源）
+ *   - 断连取消：所有等待该构建的请求断开后，自动 abort 构建，不再浪费数据源
+ *
  * @param {string} horizonKey short/mid/long
  * @param {object} quickFilters 快筛条件（clist 字段）
  * @param {number} poolSize 池子大小（默认300）
+ * @param {AbortSignal} [signal] 客户端断开信号（请求已响应后不会误取消）
  * @returns {{stocks:Array, base:object, meta:object}}
  */
-export async function buildScorePool(horizonKey = 'short', quickFilters = {}, poolSize = 300) {
-  const horizon = getHorizon(horizonKey)
+
+// 基础池单飞锁（阶段A）
+const inflightBasePools = new Map() // baseCacheKey -> Promise
+
+// 完整池后台构建记录（阶段B）：cacheKey -> { ctrl, refs, listeners, promise, ... }
+const fullBuilds = new Map()
+// 完整池构建全局串行队列：同一时刻仅允许 1 个完整池构建在跑
+const fullBuildQueue = []
+let fullBuildBusy = false
+
+export async function buildScorePool(horizonKey = 'short', quickFilters = {}, poolSize = 300, signal) {
   const sig = JSON.stringify(quickFilters || {})
   const cacheKey = `stockrec:pool:${horizonKey}:${poolSize}:${Buffer.from(sig).toString('base64')}`
   const cached = cacheGet(cacheKey)
   if (cached) return cached
 
+  // 已有该条件的完整池构建在跑/排队 → 注册断连信号，直接返回基础池
+  if (fullBuilds.has(cacheKey)) {
+    attachBuildSignal(cacheKey, signal)
+  } else {
+    // 启动后台完整构建（串行队列），不阻塞当前请求
+    const startedKey = startFullPoolBuild(horizonKey, quickFilters, poolSize)
+    attachBuildSignal(startedKey, signal)
+  }
+  return buildBasePool(horizonKey, quickFilters, poolSize)
+}
+
+/** 阶段A：基础池（快筛 + baseScore 排序取池，秒级） */
+async function buildBasePool(horizonKey, quickFilters, poolSize) {
+  const baseSig = JSON.stringify(quickFilters || {})
+  const baseKey = `stockrec:poolbase:${horizonKey}:${poolSize}:${Buffer.from(baseSig).toString('base64')}`
+  const cached = cacheGet(baseKey)
+  if (cached) return cached
+
+  if (inflightBasePools.has(baseKey)) return inflightBasePools.get(baseKey)
+
+  const promise = _buildBasePoolInner(horizonKey, quickFilters, poolSize, baseKey)
+    .finally(() => inflightBasePools.delete(baseKey))
+  inflightBasePools.set(baseKey, promise)
+  return promise
+}
+
+async function _buildBasePoolInner(horizonKey, quickFilters, poolSize, baseKey) {
+  const market = await getMarketSnapshot()
+  const normal = market.filter(s => !s.isSt)
+  const filtered = applyQuickFilters(normal, quickFilters)
+
+  const scored = filtered.map(s => ({ s, bs: baseScore(s, normal, horizonKey) }))
+  scored.sort((a, b) => b.bs - a.bs)
+  const pool = scored.slice(0, poolSize)
+
+  const stocks = pool.map(({ s, bs }) => {
+    const score = Math.round(bs)
+    return {
+      basic: { ...s },
+      total: score,
+      score,
+      star: score >= 90 ? 5 : score >= 80 ? 4 : score >= 70 ? 3 : score >= 60 ? 2 : 1,
+      conclusion: '评分构建中',
+      riskLevel: '中',
+      reasonShort: '完整评分构建中，稍后自动更新',
+      details: [],
+      dimScores: {},
+      vetoed: false,
+      aboveMa60: null,
+      techFlags: {},
+      horizon: horizonKey
+    }
+  })
+
+  const result = {
+    stocks,
+    base: null,
+    meta: {
+      stage: 'base',
+      pending: true,
+      horizon: horizonKey,
+      poolSize: stocks.length,
+      updateTime: new Date().toISOString()
+    }
+  }
+  cacheSet(baseKey, result, isTradingTime() ? 2 * 60_000 : 30 * 60_000)
+  return result
+}
+
+/** 注册断连信号：请求断开后引用计数归零 → 取消后台构建 */
+function attachBuildSignal(cacheKey, signal) {
+  if (!signal || signal.aborted) return
+  const b = fullBuilds.get(cacheKey)
+  if (!b) return
+  b.refs++
+  const onAbort = () => {
+    b.refs--
+    b.listeners.delete(signal)
+    if (b.refs <= 0) b.ctrl.abort()
+  }
+  b.listeners.set(signal, onAbort)
+  signal.addEventListener('abort', onAbort, { once: true })
+}
+
+/** 启动后台完整池构建（若该条件已有构建则复用） */
+function startFullPoolBuild(horizonKey, quickFilters, poolSize) {
+  const sig = JSON.stringify(quickFilters || {})
+  const cacheKey = `stockrec:pool:${horizonKey}:${poolSize}:${Buffer.from(sig).toString('base64')}`
+  if (fullBuilds.has(cacheKey)) return cacheKey
+
+  const b = {
+    ctrl: new AbortController(),
+    refs: 0,
+    listeners: new Map(),
+    cacheKey,
+    horizonKey,
+    quickFilters,
+    poolSize
+  }
+  fullBuilds.set(cacheKey, b)
+  b.promise = runFullPoolBuild(b).finally(() => {
+    for (const [sig, fn] of b.listeners) sig.removeEventListener('abort', fn)
+    b.listeners.clear()
+    fullBuilds.delete(cacheKey)
+  })
+  return cacheKey
+}
+
+/** 完整池构建（串行执行：同一时刻仅 1 个在跑） */
+async function runFullPoolBuild(b) {
+  await new Promise(resolve => {
+    if (!fullBuildBusy) { fullBuildBusy = true; resolve() }
+    else fullBuildQueue.push(resolve)
+  })
+  try {
+    const result = await _buildScorePoolInner(b.horizonKey, b.quickFilters, b.poolSize, b.cacheKey, b.ctrl.signal)
+    // 构建被取消（所有请求已断开）则不写缓存，避免缓存半成品/无用功
+    if (!b.ctrl.signal.aborted) {
+      cacheSet(b.cacheKey, result, isTradingTime() ? 2 * 60_000 : 30 * 60_000)
+    }
+    return result
+  } catch (e) {
+    if (e?.name !== 'AbortError') console.error('[stockScore] 评分池构建失败:', e.message)
+    return null
+  } finally {
+    const next = fullBuildQueue.shift()
+    if (next) next()
+    else fullBuildBusy = false
+  }
+}
+
+async function _buildScorePoolInner(horizonKey, quickFilters, poolSize, cacheKey, signal) {
+  const horizon = getHorizon(horizonKey)
   const market = await getMarketSnapshot()
   // 剔除 ST
   const normal = market.filter(s => !s.isSt)
@@ -967,18 +1127,18 @@ export async function buildScorePool(horizonKey = 'short', quickFilters = {}, po
   scored.sort((a, b) => b.bs - a.bs)
   const pool = scored.slice(0, poolSize).map(x => x.s)
 
-  // 补 F10 财务
+  // 补 F10 财务（支持断连取消）
   const withFin = (await pMap(pool, 20, async s => {
-    const fin = await getFinData(s.code)
+    const fin = await getFinData(s.code, {}, signal)
     return { stock: s, fin }
-  })).filter(Boolean)
+  }, signal)).filter(Boolean)
 
-  // 补 K线 + 技术指标
+  // 补 K线 + 技术指标（支持断连取消）
   const enriched = await pMap(withFin, 20, async ctx => {
-    const kline = await getKline(ctx.stock.code)
+    const kline = await getKline(ctx.stock.code, 320, signal)
     const tech = kline.length ? computeTech(kline, horizon.rsiPeriod) : null
     return { ...ctx, tech, raw: null }
-  })
+  }, signal)
 
   // 计算原始指标（供分位基准 + 评分）
   const ctxs = enriched.map(ctx => {
@@ -1047,13 +1207,13 @@ export async function buildScorePool(horizonKey = 'short', quickFilters = {}, po
     stocks: scoredStocks,
     base,
     meta: {
+      stage: 'full',
       horizon: horizonKey,
       poolSize: scoredStocks.length,
       updateTime: new Date().toISOString()
     }
   }
-  // 评分池缓存 TTL 跟随行情敏感度：交易时段短缓存，非交易时段长缓存
-  cacheSet(cacheKey, result, isTradingTime() ? 2 * 60_000 : 30 * 60_000)
+  // 注意：缓存写入统一由 runFullPoolBuild 处理（取消时不缓存）
   return result
 }
 
@@ -1061,8 +1221,17 @@ export async function buildScorePool(horizonKey = 'short', quickFilters = {}, po
 
 /**
  * 构建单只股票详情（含完整六维 + K线 + 增强数据）
+ * 结果级缓存 2 分钟：避免用户反复打开同一只股票时重复构建；
+ * 支持断连信号 signal：客户端中途离开时中止底层请求。
  */
-export async function buildStockDetail(code, horizonKey = 'short') {
+// code:horizon -> { ttl, data }
+const detailCache = new Map()
+
+export async function buildStockDetail(code, horizonKey = 'short', signal) {
+  const dkey = `${code}:${horizonKey}`
+  const cachedDetail = detailCache.get(dkey)
+  if (cachedDetail && Date.now() < cachedDetail.ttl) return cachedDetail.data
+
   const horizon = getHorizon(horizonKey)
   const market = await getMarketSnapshot()
   const stock = market.find(s => s.code === String(code))
@@ -1072,9 +1241,9 @@ export async function buildStockDetail(code, horizonKey = 'short') {
   const base = getCachedBase() || {}
 
   const [fin, kline, enhance] = await Promise.all([
-    getFinData(code, { goodwill: true }),
-    getKline(code, 320),
-    getEnhanceData(code)
+    getFinData(code, { goodwill: true }, signal),
+    getKline(code, 320, signal),
+    getEnhanceData(code, signal)
   ])
   const tech = kline.length ? computeTech(kline, horizon.rsiPeriod) : null
   const fm = computeFinMetrics(fin, stock)
@@ -1124,7 +1293,7 @@ export async function buildStockDetail(code, horizonKey = 'short') {
     }))
   }
 
-  return {
+  const data = {
     ...result,
     basic: { ...result.basic, industry: stock.industry, name: stock.name },
     kline: kline.slice(-320),
@@ -1132,6 +1301,16 @@ export async function buildStockDetail(code, horizonKey = 'short') {
     horizon: horizonKey,
     updateTime: new Date().toISOString()
   }
+  // 详情缓存：交易时段 10 分钟、非交易 30 分钟。
+  // 详情页访问频率高且常来回切换周期/代码，拉长 TTL 可显著降低对东财/腾讯的重复请求压力；
+  // 盘中评分对分钟级行情不敏感（K线缓存同为 10 分钟档），10 分钟延迟在可接受范围。
+  detailCache.set(dkey, { ttl: Date.now() + (isTradingTime() ? 10 * 60_000 : 30 * 60_000), data })
+  // 防缓存无限增长：清理过期条目
+  if (detailCache.size > 200) {
+    const now = Date.now()
+    for (const [k, v] of detailCache) if (now > v.ttl) detailCache.delete(k)
+  }
+  return data
 }
 
 export default { HORIZONS, getHorizon, buildScorePool, buildStockDetail, getCachedBase, getCachedRange, computeTech }

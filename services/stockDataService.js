@@ -5,7 +5,7 @@
  *   1. 东方财富 push2 clist     全市场行情+估值快照（一次拉全市场，缓存60s）
  *   2. 东方财富 datacenter F10  财务主要指标/利润表（按代码缓存当日）
  *   3. 东方财富 emweb F10       资产负债表-商誉（按代码缓存当日，仅详情页使用）
- *   4. 腾讯 ifzq fqkline        历史K线（技术面/风险指标计算，缓存5min）
+ *   4. 腾讯 ifzq fqkline        历史K线（技术面/风险指标计算，盘中缓存10min、非交易30min）
  *   5. 东方财富 datacenter      融资融券/机构调研/龙虎榜（增强数据，缓存当日）
  *
  * 注意：datacenter 接口有并发限流，所有请求均带重试，并控制并发数。
@@ -35,12 +35,15 @@ const DC_BASE = 'https://datacenter-web.eastmoney.com/api/data/v1/get'
 
 // ==================== 基础工具 ====================
 
-/** GET JSON（带超时+重试，应对 datacenter 限流） */
-async function getJsonWithRetry(url, headers = EASTMONEY_HEADERS, retries = 2, timeout = 12000) {
+/** GET JSON（带超时+重试，应对 datacenter 限流；支持外部取消信号 signal，客户端断开时可中止请求链） */
+async function getJsonWithRetry(url, headers = EASTMONEY_HEADERS, retries = 2, timeout = 12000, signal) {
   let lastErr
   for (let i = 0; i <= retries; i++) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), timeout)
+    const onAbort = () => controller.abort()
+    if (signal) signal.addEventListener('abort', onAbort, { once: true })
     try {
       const res = await fetch(url, { headers, signal: controller.signal })
       if (!res.ok) throw new Error(`HTTP ${res.status}`)
@@ -49,25 +52,40 @@ async function getJsonWithRetry(url, headers = EASTMONEY_HEADERS, retries = 2, t
       return j
     } catch (e) {
       lastErr = e
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError')
       if (i < retries) await new Promise(r => setTimeout(r, 600 * (i + 1)))
     } finally {
       clearTimeout(timer)
+      if (signal) signal.removeEventListener('abort', onAbort)
     }
   }
   throw lastErr || new Error('fetch failed')
 }
 
-/** 并发控制：同时最多 limit 个任务，单个失败不影响整体 */
-export async function pMap(items, limit, fn) {
+/** 并发控制：同时最多 limit 个任务，单个失败不影响整体；支持外部取消信号 signal（中断后剩余任务不再发起） */
+export async function pMap(items, limit, fn, signal) {
   const results = new Array(items.length)
   let idx = 0
-  async function worker() {
-    while (idx < items.length) {
-      const i = idx++
-      try { results[i] = await fn(items[i], i) } catch (e) { results[i] = undefined }
-    }
+  let aborted = false
+  const onAbort = () => { aborted = true }
+  if (signal) {
+    if (signal.aborted) aborted = true
+    else signal.addEventListener('abort', onAbort, { once: true })
   }
-  await Promise.all(Array.from({ length: Math.min(limit, items.length || 1) }, worker))
+  try {
+    async function worker() {
+      while (idx < items.length && !aborted) {
+        const i = idx++
+        try { results[i] = await fn(items[i], i, signal) } catch (e) {
+          if (signal?.aborted || aborted) throw new DOMException('Aborted', 'AbortError')
+          results[i] = undefined
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(limit, items.length || 1) }, worker))
+  } finally {
+    if (signal) signal.removeEventListener('abort', onAbort)
+  }
   return results
 }
 
@@ -157,10 +175,21 @@ function marketTtlMs() {
  * 带完整性校验：拉到不足 total 的 90% 时整体重试一次；仍不足则不缓存（避免残缺数据被复用）。
  * @returns {Array} 标准化后的股票数组
  */
+// 快照单飞锁：多个接口（list/industries/industry-ranking）共享同一快照，
+// 避免冷启动时并发重复拉取 56 页行情，打爆数据源。
+let snapshotInflight = null
+
 export async function getMarketSnapshot() {
   const cached = cacheGet('stockrec:market')
   if (cached) return cached
 
+  if (snapshotInflight) return snapshotInflight
+
+  snapshotInflight = _fetchMarketSnapshot().finally(() => { snapshotInflight = null })
+  return snapshotInflight
+}
+
+async function _fetchMarketSnapshot() {
   const fetchAll = async () => {
     const url = pn => `${CLIST_BASE}?pn=${pn}&pz=500&po=0&np=1&fltt=2&invt=2&fid=f12&fs=${MARKET_FS}&fields=${CLIST_FIELDS}`
     const first = await getJsonWithRetry(url(1), EASTMONEY_HEADERS, 3)
@@ -214,7 +243,7 @@ function nearestAnnualDate(reportDateStr) {
  * @param {{goodwill?: boolean}} [opts] goodwill=true 时额外获取商誉（详情页使用）
  * @returns {{mainRows:Array, incomeRows:Array, goodwill:number|null, reportDate:string|null}}
  */
-export async function getFinData(code, opts = {}) {
+export async function getFinData(code, opts = {}, signal) {
   const key = 'stockrec:fin:' + code
   const cached = cacheGet(key)
   if (cached) return cached
@@ -222,24 +251,21 @@ export async function getFinData(code, opts = {}) {
   const sc = secucodeOf(code)
   if (!sc) return null
   try {
-    const [main, income] = await Promise.all([
-      getJsonWithRetry(dcUrl('RPT_F10_FINANCE_MAINFINADATA', `(SECUCODE="${sc}")`, 'REPORT_DATE', 8), EMWEB_HEADERS),
-      getJsonWithRetry(dcUrl('RPT_F10_FINANCE_GINCOME', `(SECUCODE="${sc}")`, 'REPORT_DATE', 5), EMWEB_HEADERS)
+    // main + income 并行拉取；商誉用「最近年报日」独立并发，不再串行等待 main 返回，
+    // 将 F10 整条链路从 3 段串行压缩为 2 段并行，冷启动显著提速。
+    const annual = nearestAnnualDate(new Date().toISOString().slice(0, 10))
+    const [main, income, bal] = await Promise.all([
+      getJsonWithRetry(dcUrl('RPT_F10_FINANCE_MAINFINADATA', `(SECUCODE="${sc}")`, 'REPORT_DATE', 8), EMWEB_HEADERS, 2, 12000, signal),
+      getJsonWithRetry(dcUrl('RPT_F10_FINANCE_GINCOME', `(SECUCODE="${sc}")`, 'REPORT_DATE', 5), EMWEB_HEADERS, 2, 12000, signal),
+      opts.goodwill && annual
+        ? getJsonWithRetry(
+            `https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/zcfzbAjaxNew?companyType=4&reportDateType=0&reportType=1&dates=${annual}&code=${sc.replace('.', '')}`,
+            EMWEB_HEADERS, 1, 12000, signal
+          ).catch(() => null)
+        : Promise.resolve(null)
     ])
     const mainRows = main?.result?.data || []
-    let goodwill = null
-    if (opts.goodwill) {
-      const annual = nearestAnnualDate(mainRows[0]?.REPORT_DATE)
-      if (annual) {
-        try {
-          const bal = await getJsonWithRetry(
-            `https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/zcfzbAjaxNew?companyType=4&reportDateType=0&reportType=1&dates=${annual}&code=${sc.replace('.', '')}`,
-            EMWEB_HEADERS, 1
-          )
-          goodwill = bal?.data?.[0]?.GOODWILL ?? null
-        } catch { /* 商誉获取失败则忽略 */ }
-      }
-    }
+    const goodwill = bal?.data?.[0]?.GOODWILL ?? null
     const fin = {
       mainRows,
       incomeRows: income?.result?.data || [],
@@ -248,7 +274,8 @@ export async function getFinData(code, opts = {}) {
     }
     cacheSet(key, fin, msUntilMidnight())
     return fin
-  } catch {
+  } catch (e) {
+    if (e?.name === 'AbortError') throw e
     return null
   }
 }
@@ -256,10 +283,12 @@ export async function getFinData(code, opts = {}) {
 // ==================== 3. K线数据 ====================
 
 /**
- * 获取前复权日K线（缓存 5min）
+ * 获取前复权日K线（缓存：盘中 10 分钟，非交易 30 分钟）
+ * 技术指标（均线/MACD/波动率）对 10 分钟粒度完全不敏感，
+ * 放宽盘中缓存可显著减少池子重建时对腾讯源的重复拉取压力。
  * @returns {Array<{date,open,close,high,low,volume}>}
  */
-export async function getKline(code, days = 320) {
+export async function getKline(code, days = 320, signal) {
   const key = 'stockrec:kline:' + code
   const cached = cacheGet(key)
   if (cached) return cached
@@ -267,7 +296,7 @@ export async function getKline(code, days = 320) {
   const sym = tencentSymbol(code)
   if (!sym) return []
   try {
-    const j = await getJsonWithRetry(`https://ifzq.gtimg.cn/appstock/app/fqkline/get?param=${sym},day,,,${days},qfq`, TENXUN_HEADERS, 1)
+    const j = await getJsonWithRetry(`https://ifzq.gtimg.cn/appstock/app/fqkline/get?param=${sym},day,,,${days},qfq`, TENXUN_HEADERS, 1, 12000, signal)
     const data = j?.data?.[sym]
     const rows = data?.qfqday || data?.day || []
     const k = rows
@@ -280,9 +309,10 @@ export async function getKline(code, days = 320) {
         volume: Array.isArray(r[5]) ? Number(r[5][0]) : Number(r[5])
       }))
       .filter(x => x.close > 0)
-    cacheSet(key, k, isTradingTime() ? 2 * 60_000 : 30 * 60_000)
+    cacheSet(key, k, isTradingTime() ? 10 * 60_000 : 30 * 60_000)
     return k
-  } catch {
+  } catch (e) {
+    if (e?.name === 'AbortError') throw e
     return []
   }
 }
@@ -294,7 +324,7 @@ export async function getKline(code, days = 320) {
  * 全部尽力而为，失败返回 null/空数组
  * @returns {{margin:object|null, surveys:Array, lhb:Array}}
  */
-export async function getEnhanceData(code) {
+export async function getEnhanceData(code, signal) {
   const key = 'stockrec:enh:' + code
   const cached = cacheGet(key)
   if (cached) return cached
@@ -304,9 +334,9 @@ export async function getEnhanceData(code) {
   if (!sc) return out
 
   const tasks = [
-    ['margin', () => getJsonWithRetry(dcUrl('RPTA_WEB_RZRQ_GGMX', `(SCODE="${code}")`, 'DATE', 6, 'WEB', 'WEB'))],
-    ['surveys', () => getJsonWithRetry(dcUrl('RPT_ORG_SURVEYNEW', `(SECURITY_CODE="${code}")`, 'RECEIVE_END_DATE', 5, 'WEB', 'WEB'))],
-    ['lhb', () => getJsonWithRetry(dcUrl('RPT_BILLBOARD_DAILYDETAILS', `(SECURITY_CODE="${code}")`, '', 3, 'WEB', 'WEB'))]
+    ['margin', () => getJsonWithRetry(dcUrl('RPTA_WEB_RZRQ_GGMX', `(SCODE="${code}")`, 'DATE', 6, 'WEB', 'WEB'), EASTMONEY_HEADERS, 1, 6000, signal)],
+    ['surveys', () => getJsonWithRetry(dcUrl('RPT_ORG_SURVEYNEW', `(SECURITY_CODE="${code}")`, 'RECEIVE_END_DATE', 5, 'WEB', 'WEB'), EASTMONEY_HEADERS, 1, 6000, signal)],
+    ['lhb', () => getJsonWithRetry(dcUrl('RPT_BILLBOARD_DAILYDETAILS', `(SECURITY_CODE="${code}")`, '', 3, 'WEB', 'WEB'), EASTMONEY_HEADERS, 1, 6000, signal)]
   ]
   await Promise.allSettled(tasks.map(async ([k, fn]) => {
     try {

@@ -191,6 +191,25 @@ router.post('/recognize', async (req, res) => {
 
 // ==================== 交易记录截图解析 ====================
 
+/**
+ * 从 OCR 文本中提取股票代码/名称（尽力提取，无法确定时返回 null）
+ * @param {string} text - OCR 识别文本（每行一条）
+ * @returns {{ code: string, name: string } | null}
+ */
+function extractStockFromText(text) {
+  if (!text) return null
+  // 优先匹配带上下文的代码（如 "股票代码 301077"、"代码:301077"、"股票: 301077"）
+  const ctxCode = text.match(/(?:股票代码|证券代码|代码|股票|证券)\s*[:：]?\s*([03648]\d{5})/)
+  // 兜底：独立的 6 位 A 股代码（前后非数字）
+  const plainCode = ctxCode ? null : text.match(/(?:^|\D)([03648]\d{5})(?=\D|$)/)
+  const code = ctxCode ? ctxCode[1] : (plainCode ? plainCode[1] : '')
+  // 名称提取（如 "股票名称: 星华新材"、"名称 星华新材"）
+  const nameMatch = text.match(/(?:股票名称|证券名称|名称|股票)\s*[:：]?\s*([\u4e00-\u9fa5]{2,8})/)
+  const name = nameMatch ? nameMatch[1] : ''
+  if (!code && !name) return null
+  return { code: /^\d{6}$/.test(code) ? code : '', name }
+}
+
 // multer 配置：内存存储，限制 10MB
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -238,17 +257,19 @@ router.post('/parse-trade-records', upload.single('image'), async (req, res) => 
 
     let records = []
     let source = 'ocr'
+    let detectedStock = null
 
     // 步骤2: AI 模式
     if (useAI) {
       const deepseekKey = config.deepseekApiKey
       if (deepseekKey) {
         // 尝试 AI Vision 解析
-        const aiRecords = await parseTradeRecordsWithAI(base64Image, deepseekKey)
-        if (aiRecords.length > 0) {
-          records = aiRecords
+        const aiResult = await parseTradeRecordsWithAI(base64Image, deepseekKey)
+        if (aiResult.records.length > 0) {
+          records = aiResult.records
           source = 'ai'
-          console.log(`[ocr] AI 识别成功: ${records.length} 条记录`)
+          detectedStock = aiResult.stock || null
+          console.log(`[ocr] AI 识别成功: ${records.length} 条记录, stock:`, detectedStock)
         } else {
           console.warn('[ocr] AI 识别失败或无结果，回退到 OCR 解析')
         }
@@ -264,12 +285,18 @@ router.post('/parse-trade-records', upload.single('image'), async (req, res) => 
       console.log(`[ocr] OCR 解析: ${records.length} 条记录`)
     }
 
+    // 提取股票信息（AI 未识别到时用 OCR 文本兜底）
+    if (!detectedStock) {
+      detectedStock = extractStockFromText(ocrResult.text)
+    }
+
     res.json({
       code: 0,
       data: {
         records,
         source,
-        ocrText: ocrResult.text
+        ocrText: ocrResult.text,
+        detectedStock
       },
       message: records.length > 0
         ? `识别到 ${records.length} 条交易记录（${source === 'ai' ? 'AI' : 'OCR'} 解析）`

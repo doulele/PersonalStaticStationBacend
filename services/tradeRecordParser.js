@@ -105,11 +105,15 @@ function finalizeRecord(record, type) {
   // 提取费用（如有）
   const fee = extractFee(record.lines)
 
+  // 提取成交时间（如有）
+  const time = extractTime(record.lines.join('\n'))
+
   return {
     type,
     price: +price.toFixed(3),
     shares,
     date,
+    time,
     fee: fee !== null ? +fee.toFixed(2) : null,
     note: '截图导入',
   }
@@ -130,6 +134,21 @@ function extractDate(text) {
     return `${compact[1]}-${compact[2]}-${compact[3]}`
   }
   return ''
+}
+
+/**
+ * 从文本中提取成交时间（HH:mm:ss 或 HH:mm），无则返回空字符串
+ * 限定 A 股交易时段（09:15~15:30），避免误匹配金额等数字
+ */
+function extractTime(text) {
+  const m = text.match(/([01]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?/)
+  if (!m) return ''
+  const hh = m[1].padStart(2, '0')
+  const mm = m[2]
+  const ss = m[3] ? m[3] : '00'
+  const minutes = parseInt(hh, 10) * 60 + parseInt(mm, 10)
+  if (minutes < 9 * 60 + 15 || minutes > 15 * 60 + 30) return ''
+  return `${hh}:${mm}:${ss}`
 }
 
 /**
