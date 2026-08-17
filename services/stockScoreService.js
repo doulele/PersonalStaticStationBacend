@@ -12,7 +12,7 @@
  * 否决项：ST / 资产负债率>100% / 商誉>50% / 连续两年亏损且营收<1亿 → 强制"回避"
  */
 import { getMarketSnapshot, getFinData, getKline, getEnhanceData, pMap, isSt, isTradingTime } from './stockDataService.js'
-import { cacheGet, cacheSet } from './cacheService.js'
+import { cacheGet, cacheSet, cacheDel } from './cacheService.js'
 
 // ==================== 1. 周期配置 ====================
 
@@ -821,7 +821,7 @@ const DIM_GOOD = {
 const DIM_BAD = {
   valuation: '估值偏高',
   growth: '成长承压',
-  quality: '盈利偏弱',
+  quality: '盈利质量欠佳',
   technical: '技术走弱',
   sentiment: '资金流出',
   risk: '风险偏高'
@@ -831,9 +831,10 @@ function buildReasonShort(dims, vetoed) {
   if (vetoed) return '触发风险否决，建议回避'
   const entries = Object.entries(dims).filter(([, d]) => d.score != null).sort((a, b) => b[1].score - a[1].score)
   const good = entries.filter(([, d]) => d.score >= 72).slice(0, 2).map(([k]) => DIM_GOOD[k])
-  const bad = entries.filter(([, d]) => d.score <= 50).map(([k]) => DIM_BAD[k])
+  // 负面标签取"最低分"的短板维度（entries 已降序，取最后一个 ≤50 的）
+  const bad = entries.filter(([, d]) => d.score <= 50)
   const parts = [...good]
-  if (bad.length) parts.push(bad[0])
+  if (bad.length) parts.push(DIM_BAD[bad[bad.length - 1][0]])
   if (!parts.length) parts.push('评分中等')
   return parts.join('+')
 }
@@ -847,7 +848,9 @@ function buildReason(ctx, dims, total, conclusion, riskLevel, horizon, veto, fm)
     lines.push(`该股综合评分 ${total} 分，属于"${conclusion}"，风险等级${riskLevel}。`)
     const entries = Object.entries(dims).filter(([, d]) => d.score != null).sort((a, b) => b[1].score - a[1].score)
     const good = entries.filter(([, d]) => d.score >= 70).slice(0, 3).map(([k]) => DIM_GOOD[k])
-    const bad = entries.filter(([, d]) => d.score <= 50).slice(0, 2).map(([k]) => DIM_BAD[k])
+    // 主要风险取"最低分"的短板维度（entries 已降序，取末尾 ≤50 的最差两项）
+    const badEntries = entries.filter(([, d]) => d.score <= 50)
+    const bad = badEntries.slice(-2).reverse().map(([k]) => DIM_BAD[k])
     if (good.length) lines.push(`主要优势：${good.join('、')}。`)
     if (bad.length) lines.push(`主要风险：${bad.join('、')}。`)
     else lines.push(`暂无明显短板。`)
@@ -937,6 +940,32 @@ export function getCachedRange() {
 }
 
 /**
+ * 评分池分数快照（列表页与详情页分数对齐的核心）
+ * ------------------------------------------------------------
+ * 列表页的分数是"池内拉伸分"（stretchScore），详情页若独立计算会因
+ * range 生命周期错位而产生不一致。因此完整池构建完成后，把每只股票的
+ * 最终分（code -> total）连同 range、builtAt 一并写入快照缓存，TTL 与
+ * 池缓存一致；详情页优先复用快照中的分数，保证两端完全一致。
+ */
+const SCORE_SNAPSHOT_KEY = horizonKey => `stockrec:scoresnapshot:${horizonKey}`
+
+function writeScoreSnapshot(horizonKey, scoredStocks, range) {
+  const map = {}
+  for (const s of scoredStocks) {
+    if (s?.basic?.code != null) map[String(s.basic.code)] = s.total
+  }
+  cacheSet(SCORE_SNAPSHOT_KEY(horizonKey), {
+    range,
+    scores: map,
+    builtAt: Date.now()
+  }, isTradingTime() ? 2 * 60_000 : 30 * 60_000)
+}
+
+function readScoreSnapshot(horizonKey) {
+  return cacheGet(SCORE_SNAPSHOT_KEY(horizonKey)) || null
+}
+
+/**
  * 总分拉伸：把池内原始总分线性映射到 35~93 区间（保留排序、拉开视觉区分度）。
  * 仅在区间有效且非 veto 时使用，veto 股保持 ≤40 的原始分。
  */
@@ -978,11 +1007,17 @@ const fullBuilds = new Map()
 const fullBuildQueue = []
 let fullBuildBusy = false
 
-export async function buildScorePool(horizonKey = 'short', quickFilters = {}, poolSize = 300, signal) {
+export async function buildScorePool(horizonKey = 'short', quickFilters = {}, poolSize = 300, signal, force = false) {
   const sig = JSON.stringify(quickFilters || {})
   const cacheKey = `stockrec:pool:${horizonKey}:${poolSize}:${Buffer.from(sig).toString('base64')}`
-  const cached = cacheGet(cacheKey)
-  if (cached) return cached
+  if (force) {
+    // 强制刷新：删除完整池与基础池缓存，触发后台重建
+    cacheDel(cacheKey)
+    cacheDel(`stockrec:poolbase:${horizonKey}:${poolSize}:${Buffer.from(sig).toString('base64')}`)
+  } else {
+    const cached = cacheGet(cacheKey)
+    if (cached) return cached
+  }
 
   // 已有该条件的完整池构建在跑/排队 → 注册断连信号，直接返回基础池
   if (fullBuilds.has(cacheKey)) {
@@ -1201,6 +1236,8 @@ async function _buildScorePoolInner(horizonKey, quickFilters, poolSize, cacheKey
       s.star = s.total >= 90 ? 5 : s.total >= 80 ? 4 : s.total >= 70 ? 3 : s.total >= 60 ? 2 : 1
       s.reason = s.reason.replace(/综合评分 \d+ 分/, `综合评分 ${s.total} 分`)
     }
+    // 写入分数快照：详情页复用同一份拉伸分，保证列表/详情分数一致
+    writeScoreSnapshot(horizonKey, scoredStocks, range)
   }
 
   const result = {
@@ -1263,13 +1300,24 @@ export async function buildStockDetail(code, horizonKey = 'short', signal) {
 
   const result = scoreStock({ stock, fin, tech, enhance, raw }, base, horizon)
 
-  // 与列表页一致的分数拉伸（同一缓存窗口内区间一致；无区间或 veto 时保持原分）
-  const range = getCachedRange()
-  if (range && !result.vetoed) {
-    result.total = stretchScore(result.total, range)
-    result.conclusion = conclude(result.total, result.riskLevel, false)
+  // 与列表页一致的分数对齐：优先复用评分池快照里的最终分（与列表完全一致），
+  // 快照缺失时回退到 getCachedRange 拉伸，仍无区间则保持原始分。
+  const snapshot = readScoreSnapshot(horizonKey)
+  const snapScore = snapshot?.scores?.[String(code)]
+  if (snapScore != null) {
+    // 命中快照：直接用列表页同一次构建的拉伸分（含结论/星级一致重算）
+    result.total = snapScore
+    result.conclusion = conclude(result.total, result.riskLevel, result.vetoed)
     result.star = result.total >= 90 ? 5 : result.total >= 80 ? 4 : result.total >= 70 ? 3 : result.total >= 60 ? 2 : 1
     result.reason = result.reason.replace(/综合评分 \d+ 分/, `综合评分 ${result.total} 分`)
+  } else if (!result.vetoed) {
+    const range = snapshot?.range || getCachedRange()
+    if (range) {
+      result.total = stretchScore(result.total, range)
+      result.conclusion = conclude(result.total, result.riskLevel, false)
+      result.star = result.total >= 90 ? 5 : result.total >= 80 ? 4 : result.total >= 70 ? 3 : result.total >= 60 ? 2 : 1
+      result.reason = result.reason.replace(/综合评分 \d+ 分/, `综合评分 ${result.total} 分`)
+    }
   }
 
   // 资金情绪数据（详情展示用）

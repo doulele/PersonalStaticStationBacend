@@ -36,6 +36,15 @@ export function cacheSet(key, value, ttlMs) {
 }
 
 /**
+ * 删除缓存（用于强制刷新等场景）
+ * @param {string} key
+ * @returns {boolean} 是否删除成功
+ */
+export function cacheDel(key) {
+  return store.delete(key)
+}
+
+/**
  * 清理过期缓存（可定时调用）
  */
 export function cachePrune() {

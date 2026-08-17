@@ -95,7 +95,9 @@ router.get('/list', async (req, res) => {
   }
 
   try {
-    const { stocks, meta } = await buildScorePool(horizon, quickFilters, 300, signal)
+    // 强制刷新：refresh=1 时绕过缓存重建评分池
+    const force = q.refresh === '1' || q.refresh === 'true'
+    const { stocks, meta } = await buildScorePool(horizon, quickFilters, 300, signal, force)
 
     let list = stocks
     if (meta?.stage === 'base') {
