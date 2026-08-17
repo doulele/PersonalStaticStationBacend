@@ -92,22 +92,49 @@ router.get('/forecast', async (req, res) => {
 })
 
 // IP 定位代理（避免前端直接请求第三方被 CORS 拦截）
+// 关键：把「客户端 IP」显式传给定位服务，否则定位服务会基于后端服务器自身的出口 IP 定位，
+// 导致线上定位到服务器所在地而非用户所在地。
 router.get('/ip-locate', async (req, res) => {
-  const clientIP = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || req.socket?.remoteAddress
-  console.log(`[油价] IP定位请求，客户端IP: ${clientIP}`)
+  const clientIP = req.headers['x-forwarded-for']?.split(',')[0]?.trim()
+    || req.headers['x-real-ip']?.trim()
+    || req.ip
+    || req.socket?.remoteAddress
+  // 去掉 IPv6 前缀（如 ::ffff:1.2.3.4）
+  const normalizedIP = (clientIP || '').replace(/^::ffff:/, '')
+  console.log(`[油价] IP定位请求，客户端IP: ${clientIP} → 归一化: ${normalizedIP}`)
+
+  // 内网/保留地址无法公网定位，直接跳过（避免拿服务器出口 IP 冒充用户）
+  const isPrivateIP = (ip) => {
+    if (!ip) return true
+    if (ip === '::1' || ip === '127.0.0.1' || ip === 'localhost') return true
+    if (/^10\./.test(ip)) return true
+    if (/^192\.168\./.test(ip)) return true
+    if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(ip)) return true
+    if (/^0\./.test(ip) || /^169\.254\./.test(ip)) return true
+    return false
+  }
 
   const services = [
     async () => {
-      const resp = await axios.get('https://ipapi.co/json/', { timeout: 6000 })
-      const d = resp.data
-      return d.latitude && d.longitude ? { lat: d.latitude, lng: d.longitude, city: d.city, region: d.region } : null
-    },
-    async () => {
-      const resp = await axios.get('http://ip-api.com/json/?lang=zh-CN', { timeout: 6000 })
+      // ip-api.com 支持指定 IP 查询（免费版仅 http，服务端请求无混合内容限制）
+      const url = isPrivateIP(normalizedIP)
+        ? 'http://ip-api.com/json/?lang=zh-CN'
+        : `http://ip-api.com/json/${encodeURIComponent(normalizedIP)}?lang=zh-CN`
+      const resp = await axios.get(url, { timeout: 6000 })
       const d = resp.data
       return d.status === 'success' && d.lat && d.lon ? { lat: d.lat, lng: d.lon, city: d.city, region: d.regionName } : null
     },
     async () => {
+      // ipapi.co 支持 /{ip}/json/ 路径
+      const url = isPrivateIP(normalizedIP)
+        ? 'https://ipapi.co/json/'
+        : `https://ipapi.co/${encodeURIComponent(normalizedIP)}/json/`
+      const resp = await axios.get(url, { timeout: 6000 })
+      const d = resp.data
+      return d.latitude && d.longitude ? { lat: d.latitude, lng: d.longitude, city: d.city, region: d.region } : null
+    },
+    async () => {
+      // ip.sb 备用（无法指定 IP，仅作为最终兜底）
       const resp = await axios.get('https://api.ip.sb/geoip/', { timeout: 6000 })
       const d = resp.data
       return d.latitude && d.longitude ? { lat: d.latitude, lng: d.longitude, city: d.city, region: d.region } : null

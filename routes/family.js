@@ -1,7 +1,7 @@
 import { Router } from 'express'
-import { existsSync, mkdirSync, unlinkSync, createReadStream, statSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, unlinkSync, createReadStream, statSync, writeFileSync, readdirSync } from 'fs'
 import { fileURLToPath } from 'url'
-import { dirname, join, extname } from 'path'
+import { dirname, join, extname, resolve } from 'path'
 import crypto from 'crypto'
 import WebSocket from 'ws'
 import { dbGet, dbAll, dbRun } from '../services/db.js'
@@ -219,6 +219,19 @@ router.get('/sleep-content', (req, res) => {
         if (!allData[row.category]) allData[row.category] = []
         allData[row.category].push(JSON.parse(row.item_data))
       }
+      // 白噪音：优先用服务器音频目录里的真实文件（按文件名生成记录）
+      const audioItems = scanWhitenoiseAudio()
+      if (audioItems.length) {
+        allData.whitenoise = audioItems.map((a, i) => ({
+          id: `file-${i}`,
+          label: a.label,
+          category: a.category,
+          type: 'custom',
+          color: 'default',
+          audioUrl: a.url,
+          _size: a.size
+        }))
+      }
       return res.json({ success: true, data: allData })
     }
 
@@ -227,6 +240,23 @@ router.get('/sleep-content', (req, res) => {
         success: false,
         error: `无效的分类参数，支持: ${VALID_CATEGORIES.join(', ')}`
       })
+    }
+
+    // 单独请求白噪音分类时，同样优先返回音频目录文件
+    if (category === 'whitenoise') {
+      const audioItems = scanWhitenoiseAudio()
+      if (audioItems.length) {
+        const items = audioItems.map((a, i) => ({
+          id: `file-${i}`,
+          label: a.label,
+          category: a.category,
+          type: 'custom',
+          color: 'default',
+          audioUrl: a.url,
+          _size: a.size
+        }))
+        return res.json({ success: true, data: { whitenoise: items } })
+      }
     }
 
     const rows = dbAll('SELECT item_data FROM sleep_content WHERE category = ?', [category])
@@ -371,6 +401,77 @@ router.get('/tts-voices', (req, res) => {
 const VOICES_DIR = join(__dirname, '..', 'data', 'voices')
 const VOICE_FILE_BASE = '/staticTool/api/family'
 
+// ==================== 白噪音音频 ====================
+// 白噪音真实音频文件目录（服务器独立目录，不在代码仓库内）
+// 优先级：环境变量 WHITENOISE_AUDIO_DIR > 后端项目 data/whitenoise（默认）
+const WHITENOISE_DIR = process.env.WHITENOISE_AUDIO_DIR
+  ? resolve(process.env.WHITENOISE_AUDIO_DIR)
+  : join(__dirname, '..', 'data', 'whitenoise')
+const WHITENOISE_FILE_BASE = '/staticTool/api/family'
+const WHITENOISE_EXT = ['.mp3', '.wav', '.ogg', '.m4a', '.aac', '.flac', '.webm']
+
+/**
+ * 白噪音类别分组规则：按关键词把文件归到语义类别，同类相邻显示
+ * 顺序即列表显示顺序，未命中任何类别的归入「其他」并排在最后
+ */
+const WHITENOISE_CATEGORIES = [
+  { name: '雨声', keywords: ['雨', '雷暴'] },
+  { name: '森林', keywords: ['森林', '树叶', '微风'] },
+  { name: '水声', keywords: ['海浪', '海滩', '瀑布', '溪流', '山溪', '深海', '水石', '落水'] },
+  { name: '鸟虫鸣', keywords: ['鸟', '虫', '蛙'] },
+  { name: '纯噪音', keywords: ['白噪音', '粉红噪音', '布朗噪音'] },
+  { name: '篝火', keywords: ['篝火', '壁炉'] },
+  { name: '场景', keywords: ['咖啡馆', '火车', '日出', '夜晚'] },
+  { name: '乐器', keywords: ['风铃', '钢琴', '长笛', '钟声', '颂钵'] }
+]
+
+/** 根据文件名（去后缀）判断所属类别，未命中返回「其他」 */
+function categorizeNoise(label) {
+  for (const cat of WHITENOISE_CATEGORIES) {
+    if (cat.keywords.some(k => label.includes(k))) return cat.name
+  }
+  return '其他'
+}
+
+/**
+ * 扫描白噪音音频目录，返回 [{ label, filename, url, size, category }]
+ * 按「类别分组 + 类内名称排序」排列，同类声音相邻
+ */
+function scanWhitenoiseAudio() {
+  if (!existsSync(WHITENOISE_DIR)) return []
+  try {
+    const files = readdirSync(WHITENOISE_DIR)
+      .filter(f => WHITENOISE_EXT.includes(extname(f).toLowerCase()))
+
+    // 计算类别并排序：类别顺序 → 类内名称自然排序
+    const withCategory = files.map(f => {
+      const label = f.replace(/\.[^.]+$/, '')
+      return { filename: f, label, category: categorizeNoise(label) }
+    })
+    const categoryOrder = [...WHITENOISE_CATEGORIES.map(c => c.name), '其他']
+    const categoryIndex = c => {
+      const i = categoryOrder.indexOf(c)
+      return i === -1 ? categoryOrder.length : i
+    }
+    withCategory.sort((a, b) => {
+      const ca = categoryIndex(a.category), cb = categoryIndex(b.category)
+      if (ca !== cb) return ca - cb
+      return a.label.localeCompare(b.label, 'zh-Hans-CN', { numeric: true })
+    })
+
+    return withCategory.map(({ label, filename, category }) => ({
+      label,
+      filename,
+      category,
+      url: `${WHITENOISE_FILE_BASE}/whitenoise/file/${encodeURIComponent(filename)}`,
+      size: (() => { try { return statSync(join(WHITENOISE_DIR, filename)).size } catch { return 0 } })()
+    }))
+  } catch (e) {
+    console.error('[family/whitenoise] 扫描音频目录失败:', e)
+    return []
+  }
+}
+
 const VOICE_MIME = {
   mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg',
   webm: 'audio/webm', m4a: 'audio/mp4', aac: 'audio/aac', opus: 'audio/ogg'
@@ -477,6 +578,52 @@ router.get('/voices/file/:filename', (req, res) => {
 
   const ext = extname(filename).slice(1).toLowerCase()
   const contentType = VOICE_MIME[ext] || 'application/octet-stream'
+  const total = statSync(filePath).size
+  const range = req.headers.range
+
+  res.setHeader('Content-Type', contentType)
+  res.setHeader('Accept-Ranges', 'bytes')
+
+  if (range) {
+    const m = /bytes=(\d+)-(\d*)/.exec(range)
+    if (m) {
+      const start = parseInt(m[1], 10)
+      const end = m[2] ? parseInt(m[2], 10) : total - 1
+      if (start >= total) {
+        res.status(416).setHeader('Content-Range', `bytes */${total}`)
+        return res.end()
+      }
+      const clampedEnd = Math.min(end, total - 1)
+      res.status(206)
+      res.setHeader('Content-Range', `bytes ${start}-${clampedEnd}/${total}`)
+      res.setHeader('Content-Length', clampedEnd - start + 1)
+      const stream = createReadStream(filePath, { start, end: clampedEnd })
+      stream.on('error', () => res.status(500).end())
+      stream.pipe(res)
+      return
+    }
+  }
+
+  res.setHeader('Content-Length', total)
+  const full = createReadStream(filePath)
+  full.on('error', () => res.status(500).end())
+  full.pipe(res)
+})
+
+// ==================== 白噪音音频文件下载 ====================
+// 从服务器独立目录（WHITENOISE_DIR）读取音频文件并流式返回，支持 Range 分段（循环播放用）
+router.get('/whitenoise/file/:filename', (req, res) => {
+  let filename = req.params.filename
+  try { filename = decodeURIComponent(filename) } catch { /* 保持原样 */ }
+  // 安全校验：禁止路径穿越
+  if (filename.includes('/') || filename.includes('\\') || filename.includes('..') || filename.includes('\0')) {
+    return res.status(400).end()
+  }
+  const filePath = join(WHITENOISE_DIR, filename)
+  if (!existsSync(filePath)) return res.status(404).end()
+
+  const ext = extname(filename).slice(1).toLowerCase()
+  const contentType = VOICE_MIME[ext] || 'audio/mpeg'
   const total = statSync(filePath).size
   const range = req.headers.range
 

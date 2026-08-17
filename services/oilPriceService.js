@@ -14,27 +14,35 @@ import { cacheGet, cacheSet } from './cacheService.js'
 
 // ==================== 全国各省油价参考表 ====================
 // 单位：元/升，以省会为准。实际各地市价格差异极小（同省统一）
+//
+// 数据说明：
+//   - 92#、95#、0#柴油：参考权威第三方（小熊油耗等）2026-08-14 调价后的各省最高零售价
+//   - 本轮（2026-08-14 24时）发改委调价：汽油每吨 -230 元、柴油每吨 -220 元
+//     折合：92# -0.18 元/升，95#/0#柴油 -0.19 元/升
+//   - 98#汽油：官方不统一公布，由各经营企业自主定价，地区价差大，
+//     此处按「95# + 0.6~1.2 元」及主流平台参考价估算，仅供参考
+//   - ⚠️ 本表为静态参考表，需在每次发改委调价后人工同步更新
 const PROVINCE_PRICES = {
-  '北京':   { '92号汽油': 7.88, '95号汽油': 8.39, '98号汽油': 9.89, '0号柴油': 7.60 },
-  '上海':   { '92号汽油': 7.85, '95号汽油': 8.35, '98号汽油': 9.85, '0号柴油': 7.54 },
-  '广东':   { '92号汽油': 7.91, '95号汽油': 8.57, '98号汽油': 10.57,'0号柴油': 7.57 },
-  '浙江':   { '92号汽油': 7.86, '95号汽油': 8.36, '98号汽油': 9.86, '0号柴油': 7.55 },
-  '江苏':   { '92号汽油': 7.86, '95号汽油': 8.36, '98号汽油': 9.86, '0号柴油': 7.53 },
-  '四川':   { '92号汽油': 7.99, '95号汽油': 8.54, '98号汽油': 9.28, '0号柴油': 7.61 },
-  '湖北':   { '92号汽油': 7.89, '95号汽油': 8.45, '98号汽油': 9.95, '0号柴油': 7.55 },
-  '山东':   { '92号汽油': 7.86, '95号汽油': 8.43, '98号汽油': 9.15, '0号柴油': 7.48 },
-  '湖南':   { '92号汽油': 7.84, '95号汽油': 8.33, '98号汽油': 9.33, '0号柴油': 7.62 },
-  '河南':   { '92号汽油': 7.89, '95号汽油': 8.43, '98号汽油': 9.28, '0号柴油': 7.54 },
-  '福建':   { '92号汽油': 7.85, '95号汽油': 8.38, '98号汽油': 9.88, '0号柴油': 7.55 },
-  '安徽':   { '92号汽油': 7.85, '95号汽油': 8.40, '98号汽油': 9.60, '0号柴油': 7.60 },
-  '河北':   { '92号汽油': 7.88, '95号汽油': 8.32, '98号汽油': 9.14, '0号柴油': 7.56 },
-  '重庆':   { '92号汽油': 7.96, '95号汽油': 8.41, '98号汽油': 9.48, '0号柴油': 7.63 },
-  '陕西':   { '92号汽油': 7.78, '95号汽油': 8.22, '98号汽油': 9.72, '0号柴油': 7.45 },
-  '云南':   { '92号汽油': 8.04, '95号汽油': 8.63, '98号汽油': 9.31, '0号柴油': 7.63 },
-  '贵州':   { '92号汽油': 8.02, '95号汽油': 8.47, '98号汽油': 9.37, '0号柴油': 7.67 },
-  '广西':   { '92号汽油': 7.95, '95号汽油': 8.59, '98号汽油': 9.73, '0号柴油': 7.62 },
-  '海南':   { '92号汽油': 9.00, '95号汽油': 9.56, '98号汽油': 10.82,'0号柴油': 7.65 },
-  '江西':   { '92号汽油': 7.85, '95号汽油': 8.43, '98号汽油': 9.93, '0号柴油': 7.61 },
+  '北京':   { '92号汽油': 7.78, '95号汽油': 8.29, '98号汽油': 9.20, '0号柴油': 7.50 },
+  '上海':   { '92号汽油': 7.75, '95号汽油': 8.24, '98号汽油': 9.65, '0号柴油': 7.43 },
+  '广东':   { '92号汽油': 7.80, '95号汽油': 8.45, '98号汽油': 9.86, '0号柴油': 7.45 },
+  '浙江':   { '92号汽油': 7.75, '95号汽油': 8.25, '98号汽油': 9.45, '0号柴油': 7.43 },
+  '江苏':   { '92号汽油': 7.75, '95号汽油': 8.25, '98号汽油': 9.45, '0号柴油': 7.41 },
+  '四川':   { '92号汽油': 7.88, '95号汽油': 8.42, '98号汽油': 8.97, '0号柴油': 7.50 },
+  '湖北':   { '92号汽油': 7.79, '95号汽油': 8.34, '98号汽油': 9.44, '0号柴油': 7.44 },
+  '山东':   { '92号汽油': 7.75, '95号汽油': 8.31, '98号汽油': 9.30, '0号柴油': 7.36 },
+  '湖南':   { '92号汽油': 7.73, '95号汽油': 8.22, '98号汽油': 9.22, '0号柴油': 7.52 },
+  '河南':   { '92号汽油': 7.79, '95号汽油': 8.32, '98号汽油': 9.32, '0号柴油': 7.43 },
+  '福建':   { '92号汽油': 7.75, '95号汽油': 8.27, '98号汽油': 9.27, '0号柴油': 7.44 },
+  '安徽':   { '92号汽油': 7.74, '95号汽油': 8.28, '98号汽油': 9.28, '0号柴油': 7.44 },
+  '河北':   { '92号汽油': 7.78, '95号汽油': 8.22, '98号汽油': 9.22, '0号柴油': 7.45 },
+  '重庆':   { '92号汽油': 7.85, '95号汽油': 8.29, '98号汽油': 9.35, '0号柴油': 7.51 },
+  '陕西':   { '92号汽油': 7.67, '95号汽油': 8.10, '98号汽油': 9.10, '0号柴油': 7.51 },
+  '云南':   { '92号汽油': 7.93, '95号汽油': 8.51, '98号汽油': 8.60, '0号柴油': 7.52 },
+  '贵州':   { '92号汽油': 7.98, '95号汽油': 8.43, '98号汽油': 9.43, '0号柴油': 7.58 },
+  '广西':   { '92号汽油': 7.84, '95号汽油': 8.47, '98号汽油': 9.47, '0号柴油': 7.50 },
+  '海南':   { '92号汽油': 8.90, '95号汽油': 9.45, '98号汽油': 9.86, '0号柴油': 7.52 },
+  '江西':   { '92号汽油': 7.74, '95号汽油': 8.31, '98号汽油': 9.31, '0号柴油': 7.44 },
 }
 
 // 同省可能有多个城市，目前数据只到省级。如需城市细分可在此补充
@@ -473,36 +481,44 @@ function addToAccumulatedHistory(point) {
 // ====================================================================
 // 获取原油变化率（核心预测指标）
 // ====================================================================
-async function getOilChangeRate() {
+// 预测机制（对齐发改委规则）：
+//   本轮调价前 10 个工作日的国际原油均价，与「上次调价日」基准价对比，
+//   得出变化率。基准应为上次调价时的原油价，而非固定「14 天前」。
+async function getOilChangeRate(lastAdjustDate) {
   // 策略1：K线数据（最准确）
   const klines = await fetchOilFuturesKline()
   if (klines && klines.length >= 10) {
-    const today = new Date()
-    const lastAdjDaysBack = 14
-    const lastAdjDate = new Date(today.getTime() - lastAdjDaysBack * 86400000)
-    const lastAdjStr = lastAdjDate.toISOString().slice(0, 10)
+    // 上次调价日的日期字符串（K线 date 格式为 YYYY-MM-DD 或 YYYY/MM/DD）
+    const adjStr = lastAdjustDate
+      ? `${lastAdjustDate.getFullYear()}-${String(lastAdjustDate.getMonth() + 1).padStart(2, '0')}-${String(lastAdjustDate.getDate()).padStart(2, '0')}`
+      : null
 
+    // 找「上次调价日」当日或之后第一个交易日的收盘价作为基准价
     let baselineClose = null
-    for (const k of klines) {
-      if (k.date >= lastAdjStr) {
-        baselineClose = k.close
-        break
+    if (adjStr) {
+      for (const k of klines) {
+        const kDate = String(k.date).slice(0, 10).replace(/\//g, '-')
+        if (kDate >= adjStr) {
+          baselineClose = k.close
+          break
+        }
       }
-      baselineClose = k.close
     }
+    // 兜底：K线里找不到调价日（数据不足或日期异常）→ 用 K 线首条
     if (!baselineClose && klines.length > 0) {
       baselineClose = klines[0].close
     }
 
+    // 近 10 个交易日均价（本轮调价周期的核心参考）
     const recent10 = klines.slice(-10)
     const avgRecent = recent10.reduce((s, k) => s + k.close, 0) / recent10.length
     const pctChange = ((avgRecent - baselineClose) / baselineClose) * 100
 
-    console.log(`[油价] K线预测：基准价=${baselineClose.toFixed(2)}，近10日均价=${avgRecent.toFixed(2)}，变化率=${pctChange.toFixed(2)}%`)
+    console.log(`[油价] K线预测：基准价=${baselineClose.toFixed(2)}（上次调价${adjStr || '未知'}），近10日均价=${avgRecent.toFixed(2)}，变化率=${pctChange.toFixed(2)}%`)
     return { pctChange, source: 'kline' }
   }
 
-  // 策略2：实时行情涨跌幅
+  // 策略2：实时行情涨跌幅（K线不可用时的降级方案）
   const quote = await fetchOilRealtimeQuote()
   if (quote) {
     console.log(`[油价] 行情预测：${quote.name} 涨跌幅=${quote.changePct}%`)
@@ -648,23 +664,65 @@ export async function getProvinceHistory(province) {
 }
 
 // ==================== 调价预测 ====================
-// 国内油价每 10 个工作日调整一次
-const PRICE_ADJUST_DAYS = [
-  // 2026 年调价日历（工作日，跳过周末和法定假日）
-  // 这里取约每 14 个自然日一个调价窗口
-  '2026-01-02', '2026-01-16', '2026-02-06', '2026-02-20',
-  '2026-03-06', '2026-03-20', '2026-04-03', '2026-04-17',
-  '2026-05-08', '2026-05-22', '2026-06-05', '2026-06-19',
-  '2026-07-03', '2026-07-17', '2026-07-31', '2026-08-14',
-  '2026-09-04', '2026-09-18', '2026-10-09', '2026-10-23',
-  '2026-11-06', '2026-11-20', '2026-12-04', '2026-12-18',
-]
+// 国内油价每 10 个工作日调整一次（周末顺延，法定节假日顺延）
+
+// 已发生的调价锚点日期（最近一次，用于向前/向后推算）
+// 2026-08-14 为最近一次已落地的调价日（官方确认）
+const LAST_ADJUST_DATE = '2026-08-14'
+
+/**
+ * 判断是否为周末（0=周日，6=周六）
+ */
+function isWeekend(date) {
+  const d = date.getDay()
+  return d === 0 || d === 6
+}
+
+/**
+ * 从锚点日期向后推算「下一个调价日」（每 10 个工作日，跳过周末）
+ *
+ * 说明：
+ *   - 法定节假日顺延未在此精确处理（需节假日日历），
+ *     但工作日推算已能覆盖绝大多数场景，远优于「每14自然日」的旧估算。
+ *   - 返回 Date 对象（本地时区，避免 toISOString 的 UTC 偏移问题）
+ */
+function getNextAdjustDate(fromDate) {
+  const d = new Date(fromDate.getFullYear(), fromDate.getMonth(), fromDate.getDate())
+  let workdays = 0
+  // 最多向后推 20 个自然日（10 个工作日 + 周末缓冲）
+  while (workdays < 10) {
+    d.setDate(d.getDate() + 1)
+    if (!isWeekend(d)) workdays++
+  }
+  return d
+}
+
+/**
+ * 找到「上次调价日」（≤ 今天的最近一个调价日），用于预测基准
+ * 从锚点出发向后滚动，直到超过今天为止，返回最后一个 ≤ 今天的调价日
+ */
+function getLastAdjustDate(today) {
+  let cursor = new Date(
+    LAST_ADJUST_DATE.slice(0, 4),
+    LAST_ADJUST_DATE.slice(5, 7) - 1,
+    LAST_ADJUST_DATE.slice(8, 10)
+  )
+  let last = cursor
+  // 最多滚动 24 轮（约一年），防止死循环
+  for (let i = 0; i < 24; i++) {
+    const next = getNextAdjustDate(cursor)
+    if (next > today) break
+    last = next
+    cursor = next
+  }
+  return last
+}
 
 /**
  * 获取下次调价窗口及预测
  *
  * 预测逻辑：
- *  1. 获取原油变化率（10日均价与上次调价基准价的偏差百分比）
+ *  1. 获取原油变化率（近10日均价与「上次调价日」基准价的偏差百分比）
  *  2. 换算为国内零售价调整幅度：
  *     - 国际原油每变化 1%，国内汽油约调整 0.10~0.13 元/升
  *     - 换算依据：每吨≈1350升，系数≈0.7×7.35×汇率/1350 ≈ 0.12
@@ -672,26 +730,18 @@ const PRICE_ADJUST_DAYS = [
  */
 export async function getForecast() {
   const today = new Date()
-  const todayStr = today.toISOString().slice(0, 10)
+  today.setHours(0, 0, 0, 0)
 
-  // 找下一个调价窗口
-  let nextDate = null
-  for (let i = 0; i < PRICE_ADJUST_DAYS.length; i++) {
-    if (PRICE_ADJUST_DAYS[i] >= todayStr) {
-      nextDate = PRICE_ADJUST_DAYS[i]
-      break
-    }
-  }
-  if (!nextDate) {
-    nextDate = PRICE_ADJUST_DAYS[0].replace('2026', '2027')
-  }
+  // 动态推算：上次调价日 & 下次调价日
+  const lastAdj = getLastAdjustDate(today)
+  const nextAdj = getNextAdjustDate(lastAdj)
+  const daysLeft = Math.max(0, Math.round((nextAdj - today) / (1000 * 60 * 60 * 24)))
+  const formatNext = `${nextAdj.getMonth() + 1}月${nextAdj.getDate()}日24时`
 
-  const nextD = new Date(nextDate)
-  const daysLeft = Math.max(0, Math.ceil((nextD - today) / (1000 * 60 * 60 * 24)))
-  const formatNext = `${nextD.getMonth() + 1}月${nextD.getDate()}日24时`
+  console.log(`[油价] 调价日历推算：上次=${lastAdj.getFullYear()}-${lastAdj.getMonth() + 1}-${lastAdj.getDate()}，下次=${nextAdj.getFullYear()}-${nextAdj.getMonth() + 1}-${nextAdj.getDate()}，距今${daysLeft}天`)
 
-  // 获取原油变化率
-  const rateResult = await getOilChangeRate()
+  // 获取原油变化率（以「上次调价日」为基准）
+  const rateResult = await getOilChangeRate(lastAdj)
   let direction = 'flat'
   let changeAmount = '搁浅（不足50元/吨）'
 
@@ -699,7 +749,7 @@ export async function getForecast() {
     const { pctChange, source } = rateResult
     const isQuote = source === 'quote'
 
-    // 搁浅阈值：变化率 < 0.4%
+    // 搁浅阈值：变化率 < 0.4%（对应不足 50 元/吨）
     if (Math.abs(pctChange) < 0.4) {
       direction = 'flat'
       changeAmount = '搁浅（不足50元/吨）'

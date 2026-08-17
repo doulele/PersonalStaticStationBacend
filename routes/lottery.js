@@ -8,6 +8,8 @@ import {
   mergeData,
   getCacheStats
 } from '../services/lotteryCrawler.js'
+import { getAiLotteryRecommendation } from '../services/lotteryAiService.js'
+import { authRequired } from '../middlewares/auth.js'
 import config from '../config/index.js'
 
 const router = Router()
@@ -327,6 +329,42 @@ router.post('/verify-password', (req, res) => {
     return res.json({ code: -1, msg: '密码错误', data: { valid: false } })
   }
   res.json({ code: 1, msg: '验证通过', data: { valid: true } })
+})
+
+/**
+ * POST /lottery/ai-recommend
+ * DeepSeek 智能选号推荐（需登录）
+ * body: { type: 'ssq'|'dlt', groupCount: 5 }
+ */
+router.post('/ai-recommend', authRequired, async (req, res, next) => {
+  try {
+    const { type, groupCount = 5 } = req.body
+    if (!['ssq', 'dlt'].includes(type)) {
+      return res.json({ code: -1, msg: '类型无效，仅支持 ssq / dlt', data: null })
+    }
+
+    // 从缓存读取历史数据
+    const data = readCache(type)
+    if (!data || data.length === 0) {
+      return res.json({ code: -1, msg: `暂无 ${type} 缓存数据，请先同步数据`, data: null })
+    }
+
+    console.log(`[lottery/ai-recommend] ${type} 生成 ${groupCount} 组推荐（用户: ${req.userId}）`)
+
+    const result = await getAiLotteryRecommendation({
+      type,
+      data,
+      groupCount: Math.min(Math.max(Number(groupCount) || 5, 1), 15)
+    })
+
+    if (!result) {
+      return res.json({ code: -1, msg: 'AI 推荐失败，请稍后重试', data: null })
+    }
+
+    res.json({ code: 1, msg: 'ok', data: result })
+  } catch (err) {
+    next(err)
+  }
 })
 
 export default router
