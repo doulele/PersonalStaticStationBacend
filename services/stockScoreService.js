@@ -34,7 +34,7 @@ let _stockCfg = null
 function loadStockConfig() {
   if (_stockCfg) return _stockCfg
   const defaults = {
-    poolSize: 200,
+    poolSize: 250,
     coarseFilter: { minPeTtm: 0, minPb: 0, minRoe: 0, minTurnoverRate: 0.1, minMarketCapYi: null }
   }
   try {

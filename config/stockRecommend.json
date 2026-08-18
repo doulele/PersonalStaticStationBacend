@@ -1,5 +1,5 @@
 {
-  "poolSize": 200,
+  "poolSize": 250,
   "coarseFilter": {
     "minPeTtm": 0,
     "minPb": 0,
