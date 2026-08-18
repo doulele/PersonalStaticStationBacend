@@ -9,7 +9,7 @@
  */
 import { Router } from 'express'
 import { buildScorePool, buildStockDetail, HORIZONS } from '../services/stockScoreService.js'
-import { getMarketSnapshot } from '../services/stockDataService.js'
+import { getMarketSnapshot, boardOf } from '../services/stockDataService.js'
 
 const router = Router()
 
@@ -52,6 +52,7 @@ router.get('/list', async (req, res) => {
 
   // 快筛条件（影响池子构成）
   const quickFilters = {
+    boards: q.boards ? String(q.boards).split(',').filter(Boolean) : null,
     industry: q.industry || null,
     minPe: num(q, 'minPe'), maxPe: num(q, 'maxPe'),
     minPb: num(q, 'minPb'), maxPb: num(q, 'maxPb'),
@@ -97,7 +98,7 @@ router.get('/list', async (req, res) => {
   try {
     // 强制刷新：refresh=1 时绕过缓存重建评分池
     const force = q.refresh === '1' || q.refresh === 'true'
-    const { stocks, meta } = await buildScorePool(horizon, quickFilters, 300, signal, force)
+    const { stocks, meta } = await buildScorePool(horizon, quickFilters, null, signal, force)
 
     let list = stocks
     if (meta?.stage === 'base') {
@@ -207,6 +208,7 @@ router.get('/list', async (req, res) => {
     const rows = list.slice(start, start + pageSize).map(s => ({
       code: s.basic.code,
       name: s.basic.name,
+      board: boardOf(s.basic.code),
       industry: s.basic.industry,
       price: s.basic.price,
       changePct: s.basic.changePct,
@@ -268,8 +270,9 @@ router.get('/search', async (req, res) => {
 /** 行业评分排名（复用评分池，按行业聚合平均分/最高分） */
 router.get('/industry-ranking', async (req, res) => {
   const horizon = ['short', 'mid', 'long'].includes(req.query.horizon) ? req.query.horizon : 'short'
+  const boards = req.query.boards ? String(req.query.boards).split(',').filter(Boolean) : null
   try {
-    const { stocks } = await buildScorePool(horizon, {}, 300)
+    const { stocks } = await buildScorePool(horizon, { boards }, null)
     const map = new Map()
     stocks.forEach(s => {
       const ind = s.basic?.industry

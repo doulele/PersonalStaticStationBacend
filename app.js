@@ -83,10 +83,13 @@ async function startServer() {
     prewarmLock = true
     try {
       console.log('[StockRec] 评分池预热开始...')
-      for (const h of ['short', 'mid', 'long']) {
-        await buildScorePool(h, {}, 300)
-        console.log(`[StockRec] 预热完成: ${h}`)
-      }
+      // 三周期并行触发完整池构建：buildScorePool 立即返回基础池（秒级），
+      // 完整池在后台按 horizon 并行跑（runFullPoolBuild 已按 horizon 分键，不再互相阻塞）
+      // 预热使用默认板块（沪市主板+深市主板），与前端默认筛选一致，确保缓存命中。
+      const DEFAULT_BOARDS = ['sh_main', 'sz_main']
+      await Promise.all(['short', 'mid', 'long'].map(h =>
+        buildScorePool(h, { boards: DEFAULT_BOARDS }, null).then(() => console.log(`[StockRec] 预热触发: ${h}`))
+      ))
     } catch (err) {
       console.error('[StockRec] 评分池预热失败:', err.message)
     } finally {

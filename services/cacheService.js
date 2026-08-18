@@ -1,28 +1,80 @@
 /**
- * 简易内存缓存 — 减少对高德 API 的重复调用
+ * 内存 + 磁盘两级缓存
+ * ------------------------------------------------------------
+ * 内存缓存：热点数据，进程生命周期内有效（重启失效）
+ * 磁盘缓存：可选持久化，重启后仍可复用（TTL 依然生效，过期自动失效）
  *
- * 设计原则：
- *   - 热点搜索（region-hot）：缓存 1 小时（热门景点排行不常变）
- *   - IP 定位：缓存 30 分钟（IP 在短时间内不会跳变）
- *   - 地理编码：缓存 24 小时（经纬度几乎不变）
- *   - 其他查询（搜索/动态规划）：不缓存（需要实时结果）
+ * 持久化仅用于"当日不变"类数据（如 F10 财务、增强数据），
+ * 通过 cacheSet(key, value, ttlMs, true) / cacheGet(key, true) 启用。
+ * 磁盘文件存放于 data/stockrec-cache/，按 key 的 md5 命名，原子写入，
+ * 避免服务重启后冷启动需重新爬取数百个外部接口请求。
  */
+import fs from 'fs'
+import path from 'path'
+import crypto from 'crypto'
 
 const store = new Map()
+
+// 磁盘缓存目录
+const DISK_DIR = path.join(process.cwd(), 'data', 'stockrec-cache')
+
+function diskFileOf(key) {
+  const hash = crypto.createHash('md5').update(key).digest('hex')
+  return path.join(DISK_DIR, hash + '.json')
+}
+
+/** 读磁盘缓存（判断 TTL，过期则删除文件返回 null） */
+function diskCacheGet(key) {
+  try {
+    const f = diskFileOf(key)
+    if (!fs.existsSync(f)) return null
+    const j = JSON.parse(fs.readFileSync(f, 'utf8'))
+    if (!j || Date.now() > j.expiresAt) {
+      try { fs.unlinkSync(f) } catch { /* ignore */ }
+      return null
+    }
+    return j // { value, expiresAt }
+  } catch {
+    return null
+  }
+}
+
+/** 写磁盘缓存（原子替换，避免半写文件；失败不影响功能，退回纯内存缓存） */
+function diskCacheSet(key, value, ttlMs) {
+  try {
+    if (!fs.existsSync(DISK_DIR)) fs.mkdirSync(DISK_DIR, { recursive: true })
+    const f = diskFileOf(key)
+    const tmp = f + '.tmp'
+    fs.writeFileSync(tmp, JSON.stringify({ expiresAt: Date.now() + ttlMs, value }))
+    fs.renameSync(tmp, f)
+  } catch (e) {
+    console.error('[cache] 磁盘缓存写入失败:', e.message)
+  }
+}
 
 /**
  * 获取缓存
  * @param {string} key
+ * @param {boolean} [persist] 是否启用磁盘兜底（内存 miss 时尝试读磁盘）
  * @returns {any|null}
  */
-export function cacheGet(key) {
+export function cacheGet(key, persist = false) {
   const entry = store.get(key)
-  if (!entry) return null
-  if (Date.now() > entry.expiresAt) {
-    store.delete(key)
-    return null
+  if (entry) {
+    if (Date.now() > entry.expiresAt) {
+      store.delete(key)
+      return null
+    }
+    return entry.value
   }
-  return entry.value
+  if (persist) {
+    const j = diskCacheGet(key)
+    if (j) {
+      store.set(key, { value: j.value, expiresAt: j.expiresAt })
+      return j.value
+    }
+  }
+  return null
 }
 
 /**
@@ -30,14 +82,15 @@ export function cacheGet(key) {
  * @param {string} key
  * @param {any} value
  * @param {number} ttlMs - 过期时间（毫秒）
+ * @param {boolean} [persist] 是否同时落盘（仅"当日不变"类数据启用）
  */
-export function cacheSet(key, value, ttlMs) {
+export function cacheSet(key, value, ttlMs, persist = false) {
   store.set(key, { value, expiresAt: Date.now() + ttlMs })
+  if (persist) diskCacheSet(key, value, ttlMs)
 }
 
 /**
  * 删除缓存（用于强制刷新等场景）
- * @param {string} key
  * @returns {boolean} 是否删除成功
  */
 export function cacheDel(key) {

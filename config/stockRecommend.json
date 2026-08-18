@@ -1,0 +1,10 @@
+{
+  "poolSize": 200,
+  "coarseFilter": {
+    "minPeTtm": 0,
+    "minPb": 0,
+    "minRoe": 0,
+    "minTurnoverRate": 0.1,
+    "minMarketCapYi": null
+  }
+}

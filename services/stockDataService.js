@@ -106,6 +106,16 @@ export function secucodeOf(code) {
   return mkt ? `${c}.${mkt}` : ''
 }
 
+/** 代码前缀 → 板块（沪深主板/创业板/科创板） */
+export function boardOf(code) {
+  const c = String(code)
+  if (c.startsWith('688')) return 'star'       // 科创板
+  if (c.startsWith('30')) return 'chinext'     // 创业板
+  if (c.startsWith('6')) return 'sh_main'      // 沪市主板
+  if (c.startsWith('0')) return 'sz_main'      // 深市主板
+  return 'other'
+}
+
 /** 代码 → 腾讯市场前缀（600519 → sh600519） */
 export function tencentSymbol(code) {
   const c = String(code)
@@ -180,7 +190,7 @@ function marketTtlMs() {
 let snapshotInflight = null
 
 export async function getMarketSnapshot() {
-  const cached = cacheGet('stockrec:market')
+  const cached = cacheGet('stockrec:market', true)
   if (cached) return cached
 
   if (snapshotInflight) return snapshotInflight
@@ -197,8 +207,8 @@ async function _fetchMarketSnapshot() {
     // 探测东财实际返回的每页条数（可能被裁剪到 100），动态决定页数
     const pageSize = first?.data?.diff?.length || 100
     const pages = Math.max(1, Math.ceil(total / pageSize))
-    // 并发 3 页（东财对 clist 单页裁剪较宽松，3 并发不会触发限流），显著缩短快照耗时
-    const others = await pMap(Array.from({ length: pages - 1 }, (_, i) => i + 2), 3, async pn => {
+    // 并发 6 页拉取，显著缩短全市场快照耗时（单页失败由 getJsonWithRetry 内部重试兜底）
+    const others = await pMap(Array.from({ length: pages - 1 }, (_, i) => i + 2), 6, async pn => {
       const j = await getJsonWithRetry(url(pn), EASTMONEY_HEADERS, 3)
       return j
     })
@@ -217,7 +227,7 @@ async function _fetchMarketSnapshot() {
     console.warn(`[stockData] 快照仍不完整 ${stocks.length}/${total}，本次不缓存`)
     return stocks
   }
-  cacheSet('stockrec:market', stocks, marketTtlMs())
+  cacheSet('stockrec:market', stocks, marketTtlMs(), !isTradingTime())
   return stocks
 }
 
@@ -245,7 +255,7 @@ function nearestAnnualDate(reportDateStr) {
  */
 export async function getFinData(code, opts = {}, signal) {
   const key = 'stockrec:fin:' + code
-  const cached = cacheGet(key)
+  const cached = cacheGet(key, true)
   if (cached) return cached
 
   const sc = secucodeOf(code)
@@ -272,7 +282,7 @@ export async function getFinData(code, opts = {}, signal) {
       goodwill,
       reportDate: mainRows[0]?.REPORT_DATE || null
     }
-    cacheSet(key, fin, msUntilMidnight())
+    cacheSet(key, fin, msUntilMidnight(), true)
     return fin
   } catch (e) {
     if (e?.name === 'AbortError') throw e
@@ -326,7 +336,7 @@ export async function getKline(code, days = 320, signal) {
  */
 export async function getEnhanceData(code, signal) {
   const key = 'stockrec:enh:' + code
-  const cached = cacheGet(key)
+  const cached = cacheGet(key, true)
   if (cached) return cached
 
   const sc = secucodeOf(code)
@@ -349,7 +359,7 @@ export async function getEnhanceData(code, signal) {
     } catch { /* 忽略单个数据源失败 */ }
   }))
 
-  cacheSet(key, out, msUntilMidnight())
+  cacheSet(key, out, msUntilMidnight(), true)
   return out
 }
 

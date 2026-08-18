@@ -11,8 +11,49 @@
  * 缺失处理：子指标缺失→权重分摊；整维度缺失→维度权重按比例分摊到其他维度
  * 否决项：ST / 资产负债率>100% / 商誉>50% / 连续两年亏损且营收<1亿 → 强制"回避"
  */
-import { getMarketSnapshot, getFinData, getKline, getEnhanceData, pMap, isSt, isTradingTime } from './stockDataService.js'
+import { getMarketSnapshot, getFinData, getKline, getEnhanceData, pMap, isSt, isTradingTime, boardOf } from './stockDataService.js'
 import { cacheGet, cacheSet, cacheDel } from './cacheService.js'
+import fs from 'fs'
+import path from 'path'
+
+// ==================== 0. 可配置项（config/stockRecommend.json） ====================
+
+const STOCK_CFG_PATH = path.join(process.cwd(), 'config', 'stockRecommend.json')
+let _stockCfg = null
+
+/**
+ * 加载股票测评配置（粗筛门槛 / 池子大小），文件缺失或解析失败时用默认值兜底。
+ * 字段说明：
+ *   poolSize                       评分池大小（进入 F10/K线 细筛的股票数）
+ *   coarseFilter.minPeTtm          PE(TTM) 下限，0=剔除亏损股；null=不限制
+ *   coarseFilter.minPb             PB 下限，0=剔除资不抵债；null=不限制
+ *   coarseFilter.minRoe            ROE 下限，0=剔除 ROE 为负；null=不限制
+ *   coarseFilter.minTurnoverRate   换手率下限（%），0.1=剔除疑似停牌/仙股；null=不限制
+ *   coarseFilter.minMarketCapYi    总市值下限（亿元），null=不限制
+ */
+function loadStockConfig() {
+  if (_stockCfg) return _stockCfg
+  const defaults = {
+    poolSize: 200,
+    coarseFilter: { minPeTtm: 0, minPb: 0, minRoe: 0, minTurnoverRate: 0.1, minMarketCapYi: null }
+  }
+  try {
+    if (fs.existsSync(STOCK_CFG_PATH)) {
+      const j = JSON.parse(fs.readFileSync(STOCK_CFG_PATH, 'utf8'))
+      _stockCfg = {
+        ...defaults,
+        ...j,
+        coarseFilter: { ...defaults.coarseFilter, ...(j.coarseFilter || {}) }
+      }
+    } else {
+      _stockCfg = defaults
+    }
+  } catch (e) {
+    console.error('[stockScore] 读取 config/stockRecommend.json 失败，使用默认配置:', e.message)
+    _stockCfg = defaults
+  }
+  return _stockCfg
+}
 
 // ==================== 1. 周期配置 ====================
 
@@ -378,6 +419,16 @@ function computeFinMetrics(fin, stock) {
   const profit = computeGrowth(incomeRows, 'PARENT_NETPROFIT')
 
   const roe = main.ROEJQ != null ? Number(main.ROEJQ) : (stock.roe ?? null)
+
+  // 扣非净利润校验：识别"利润靠一次性非经常性损益堆高"导致的 ROE 虚高
+  // 归母净利润（最新报告期累计），优先取主要指标表，缺失则回退利润表
+  const parentProfit = main.PARENTNETPROFIT != null
+    ? Number(main.PARENTNETPROFIT)
+    : (incomeRows.length ? Number(incomeRows[0].PARENT_NETPROFIT) : null)
+  const deductProfit = main.KCFJCXSYJLR != null ? Number(main.KCFJCXSYJLR) : null
+  // 扣非/归母占比：<1 说明部分利润来自非经常性损益，占比越低水分越大
+  const deductRatio = (deductProfit != null && parentProfit != null && parentProfit > 0) ? deductProfit / parentProfit : null
+
   // ROE 趋势：连续上升季度数
   let roeTrend = 0
   const roes = fin.mainRows.map(r => Number(r.ROEJQ)).filter(v => !isNaN(v))
@@ -401,6 +452,8 @@ function computeFinMetrics(fin, stock) {
     reportDate: fin.reportDate,
     roe,
     roeTrend,
+    deductProfit,
+    deductRatio,
     grossMargin: main.XSMLL != null ? Number(main.XSMLL) : null,
     netMargin: main.XSJLL != null ? Number(main.XSJLL) : null,
     ocfRatio,
@@ -513,11 +566,18 @@ export function scoreStock(ctx, base, horizon) {
   // ---------- 盈利质量维度 ----------
   const roeScore = (() => {
     if (fm?.roe == null) return null
+    // 扣非净利润 ≤ 0：主营不赚钱，披露 ROE 被非经常性损益虚高，强制压到低分
+    if (fm?.deductProfit != null && fm.deductProfit <= 0) return 20
     const abs = thresh(fm.roe, [[20, 999, 95], [10, 20, 80], [5, 10, 60], [0, 5, 35], [-999, 0, 20]])
-    return clampScore(abs * 0.6 + pct(fm.roe, base.roe) * 0.4)
+    let score = clampScore(abs * 0.6 + pct(fm.roe, base.roe) * 0.4)
+    // 扣非占比偏低（利润大量依赖非经常性损益）→ 按占比打折
+    if (fm?.deductRatio != null && fm.deductRatio < 1) {
+      score = clampScore(score * (0.5 + 0.5 * fm.deductRatio))
+    }
+    return score
   })()
   const qualityItems = [
-    { name: 'ROE(净资产收益率)', value: fm?.roe != null ? fm.roe.toFixed(2) + '%' : '数据缺失', raw: fm?.roe ?? null, score: roeScore, weight: 25 },
+    { name: 'ROE(净资产收益率)', value: fm?.roe != null ? (fm.roe.toFixed(2) + '%' + (fm?.deductProfit != null && fm.deductProfit <= 0 ? '(扣非亏损)' : (fm?.deductRatio != null && fm.deductRatio < 0.5 ? '(含非经常损益)' : ''))) : '数据缺失', raw: fm?.roe ?? null, score: roeScore, weight: 25 },
     { name: '毛利率', value: fm?.grossMargin != null ? fm.grossMargin.toFixed(2) + '%' : '数据缺失', raw: fm?.grossMargin ?? null, score: pctUp(fm?.grossMargin, base.gross), weight: 20 },
     { name: '净利率', value: fm?.netMargin != null ? fm.netMargin.toFixed(2) + '%' : '数据缺失', raw: fm?.netMargin ?? null, score: pctUp(fm?.netMargin, base.net), weight: 15 },
     { name: '经营现金流/净利润', value: fm?.ocfRatio != null ? fm.ocfRatio.toFixed(2) : '数据缺失', raw: fm?.ocfRatio ?? null, score: thresh(fm?.ocfRatio, [[1, 999, 90], [0.5, 1, 70], [-999, 0.5, 40]]), weight: 20 },
@@ -912,6 +972,7 @@ function baseScore(stock, market, horizonKey = 'short') {
 function applyQuickFilters(stocks, qf) {
   if (!qf) return stocks
   return stocks.filter(s => {
+    if (qf.boards && qf.boards.length && !qf.boards.includes(boardOf(s.code))) return false
     if (qf.industry && s.industry !== qf.industry) return false
     if (qf.minMarketCap != null && (!s.marketCap || s.marketCap < qf.minMarketCap)) return false
     if (qf.maxMarketCap != null && (!s.marketCap || s.marketCap > qf.maxMarketCap)) return false
@@ -925,6 +986,28 @@ function applyQuickFilters(stocks, qf) {
     if (qf.maxTurnover != null && (s.turnoverRate == null || s.turnoverRate > qf.maxTurnover)) return false
     return true
   })
+}
+
+/**
+ * 粗筛质量门槛（零额外请求，仅用 clist 快照已有字段）
+ * ------------------------------------------------------------
+ * 在 baseScore 排序取池之前，硬性剔除明显不合格标的，使其不再进入 F10/K线 细筛，
+ * 从而减少 datacenter/腾讯的请求量、加快完整评分池构建（"先粗筛再细筛"）。
+ * 注意：字段为 null（数据缺失）时不剔除，避免误杀——只剔除"明确为负/异常"的标的。
+ */
+function coarseFilter(s) {
+  const cf = loadStockConfig().coarseFilter
+  // 亏损股：PE(TTM) 低于下限（默认 0 剔除亏损；设 null 可保留困境反转股）
+  if (cf.minPeTtm != null && s.peTtm != null && s.peTtm < cf.minPeTtm) return false
+  // 资不抵债：PB 低于下限（默认 0 剔除净资产为负）
+  if (cf.minPb != null && s.pb != null && s.pb < cf.minPb) return false
+  // 盈利能力：ROE 低于下限（默认 0 剔除 ROE 为负）
+  if (cf.minRoe != null && s.roe != null && s.roe < cf.minRoe) return false
+  // 流动性：换手率低于下限（默认 0.1% 剔除疑似停牌/仙股）
+  if (cf.minTurnoverRate != null && s.turnoverRate != null && s.turnoverRate < cf.minTurnoverRate) return false
+  // 市值下限（亿元，默认 null 不限制）
+  if (cf.minMarketCapYi != null && s.marketCap != null && s.marketCap < cf.minMarketCapYi * 1e8) return false
+  return true
 }
 
 /** 构建分位基准并缓存（供详情页使用），返回 base */
@@ -1003,11 +1086,13 @@ const inflightBasePools = new Map() // baseCacheKey -> Promise
 
 // 完整池后台构建记录（阶段B）：cacheKey -> { ctrl, refs, listeners, promise, ... }
 const fullBuilds = new Map()
-// 完整池构建全局串行队列：同一时刻仅允许 1 个完整池构建在跑
-const fullBuildQueue = []
-let fullBuildBusy = false
+// 完整池构建串行队列（按 horizon 分键）：同一 horizon 同一时刻仅 1 个完整池构建在跑，
+// 不同 horizon 可并行（各周期请求的股票/指标独立），避免 short/mid/long 三周期预热互相排队阻塞。
+const fullBuildQueues = new Map() // horizonKey -> Array<resolve>
+const fullBuildBusy = new Map()   // horizonKey -> boolean
 
-export async function buildScorePool(horizonKey = 'short', quickFilters = {}, poolSize = 300, signal, force = false) {
+export async function buildScorePool(horizonKey = 'short', quickFilters = {}, poolSize = null, signal, force = false) {
+  if (poolSize == null) poolSize = loadStockConfig().poolSize
   const sig = JSON.stringify(quickFilters || {})
   const cacheKey = `stockrec:pool:${horizonKey}:${poolSize}:${Buffer.from(sig).toString('base64')}`
   if (force) {
@@ -1048,7 +1133,7 @@ async function buildBasePool(horizonKey, quickFilters, poolSize) {
 async function _buildBasePoolInner(horizonKey, quickFilters, poolSize, baseKey) {
   const market = await getMarketSnapshot()
   const normal = market.filter(s => !s.isSt)
-  const filtered = applyQuickFilters(normal, quickFilters)
+  const filtered = applyQuickFilters(normal, quickFilters).filter(coarseFilter)
 
   const scored = filtered.map(s => ({ s, bs: baseScore(s, normal, horizonKey) }))
   scored.sort((a, b) => b.bs - a.bs)
@@ -1129,9 +1214,14 @@ function startFullPoolBuild(horizonKey, quickFilters, poolSize) {
 
 /** 完整池构建（串行执行：同一时刻仅 1 个在跑） */
 async function runFullPoolBuild(b) {
+  const hk = b.horizonKey
   await new Promise(resolve => {
-    if (!fullBuildBusy) { fullBuildBusy = true; resolve() }
-    else fullBuildQueue.push(resolve)
+    if (!fullBuildBusy.get(hk)) { fullBuildBusy.set(hk, true); resolve() }
+    else {
+      const q = fullBuildQueues.get(hk) || []
+      q.push(resolve)
+      fullBuildQueues.set(hk, q)
+    }
   })
   try {
     const result = await _buildScorePoolInner(b.horizonKey, b.quickFilters, b.poolSize, b.cacheKey, b.ctrl.signal)
@@ -1144,9 +1234,10 @@ async function runFullPoolBuild(b) {
     if (e?.name !== 'AbortError') console.error('[stockScore] 评分池构建失败:', e.message)
     return null
   } finally {
-    const next = fullBuildQueue.shift()
+    const q = fullBuildQueues.get(hk)
+    const next = q?.shift()
     if (next) next()
-    else fullBuildBusy = false
+    else fullBuildBusy.set(hk, false)
   }
 }
 
@@ -1155,7 +1246,7 @@ async function _buildScorePoolInner(horizonKey, quickFilters, poolSize, cacheKey
   const market = await getMarketSnapshot()
   // 剔除 ST
   const normal = market.filter(s => !s.isSt)
-  const filtered = applyQuickFilters(normal, quickFilters)
+  const filtered = applyQuickFilters(normal, quickFilters).filter(coarseFilter)
 
   // 基础分排序取池（权重随周期）
   const scored = filtered.map(s => ({ s, bs: baseScore(s, normal, horizonKey) }))
@@ -1163,13 +1254,13 @@ async function _buildScorePoolInner(horizonKey, quickFilters, poolSize, cacheKey
   const pool = scored.slice(0, poolSize).map(x => x.s)
 
   // 补 F10 财务（支持断连取消）
-  const withFin = (await pMap(pool, 20, async s => {
+  const withFin = (await pMap(pool, 30, async s => {
     const fin = await getFinData(s.code, {}, signal)
     return { stock: s, fin }
   }, signal)).filter(Boolean)
 
   // 补 K线 + 技术指标（支持断连取消）
-  const enriched = await pMap(withFin, 20, async ctx => {
+  const enriched = await pMap(withFin, 30, async ctx => {
     const kline = await getKline(ctx.stock.code, 320, signal)
     const tech = kline.length ? computeTech(kline, horizon.rsiPeriod) : null
     return { ...ctx, tech, raw: null }
@@ -1304,6 +1395,8 @@ export async function buildStockDetail(code, horizonKey = 'short', signal) {
   // 快照缺失时回退到 getCachedRange 拉伸，仍无区间则保持原始分。
   const snapshot = readScoreSnapshot(horizonKey)
   const snapScore = snapshot?.scores?.[String(code)]
+  // 分数是否已与列表池快照对齐（快照未就绪时详情独立计算，可能与列表基础分不一致）
+  const scoreAligned = snapScore != null
   if (snapScore != null) {
     // 命中快照：直接用列表页同一次构建的拉伸分（含结论/星级一致重算）
     result.total = snapScore
@@ -1349,10 +1442,13 @@ export async function buildStockDetail(code, horizonKey = 'short', signal) {
     horizon: horizonKey,
     updateTime: new Date().toISOString()
   }
-  // 详情缓存：交易时段 10 分钟、非交易 30 分钟。
-  // 详情页访问频率高且常来回切换周期/代码，拉长 TTL 可显著降低对东财/腾讯的重复请求压力；
-  // 盘中评分对分钟级行情不敏感（K线缓存同为 10 分钟档），10 分钟延迟在可接受范围。
-  detailCache.set(dkey, { ttl: Date.now() + (isTradingTime() ? 10 * 60_000 : 30 * 60_000), data })
+  // 详情缓存：分数已与列表快照对齐 → 交易时段 10 分钟、非交易 30 分钟；
+  // 未对齐（评分池快照尚未就绪）→ 仅缓存 30 秒，待完整池就绪后重算，保证与列表分数一致。
+  // 详情页访问频率高且常来回切换周期/代码，长 TTL 可显著降低对东财/腾讯的重复请求压力。
+  const cacheTtl = scoreAligned
+    ? (isTradingTime() ? 10 * 60_000 : 30 * 60_000)
+    : 30 * 1000
+  detailCache.set(dkey, { ttl: Date.now() + cacheTtl, data })
   // 防缓存无限增长：清理过期条目
   if (detailCache.size > 200) {
     const now = Date.now()
