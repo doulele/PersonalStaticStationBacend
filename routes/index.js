@@ -20,6 +20,7 @@ import eternalArchiveRoutes from './eternalArchive.js'
 import recipeLabRoutes from './recipeLab.js'
 import nationalTeamRoutes from './nationalTeam.js'
 import stockRecommendRoutes from './stockRecommend.js'
+import knowledgeGraphRoutes from './knowledgeGraph.js'
 
 const router = Router()
 
@@ -54,6 +55,7 @@ router.use('/eternal-archive', eternalArchiveRoutes)
 router.use('/recipe-lab', recipeLabRoutes)
 router.use('/national-team', nationalTeamRoutes)
 router.use('/stock-recommend', stockRecommendRoutes)
+router.use('/knowledge-graph', knowledgeGraphRoutes)
 
 // 健康检查
 router.get('/health', (req, res) => {

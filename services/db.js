@@ -48,6 +48,12 @@ export async function initDatabase() {
   // 创建所有表
   createTables()
 
+  // 初始化前端知识图谱数据（知识点 + 题目，首次自动导入）
+  await seedKnowledgeGraph()
+
+  // 初始化专属面试题库（首次自动导入）
+  await seedInterviewQuestions()
+
   // 首次写入磁盘
   saveToDisk()
 
@@ -658,6 +664,153 @@ function createTables() {
       source_used TEXT
     )
   `)
+
+  // ========== 前端知识图谱（技能成长平台）相关表 ==========
+
+  // 知识点（静态内容）
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS kg_nodes (
+      id      TEXT PRIMARY KEY,
+      cat     TEXT NOT NULL,
+      name    TEXT NOT NULL,
+      level   INTEGER DEFAULT 1,
+      deps    TEXT DEFAULT '[]',
+      content TEXT DEFAULT '',
+      sort    INTEGER DEFAULT 0
+    )
+  `)
+
+  // 题目（静态内容）
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS kg_questions (
+      id      TEXT PRIMARY KEY,
+      cat     TEXT NOT NULL,
+      node    TEXT DEFAULT '',
+      type    TEXT DEFAULT 'single',
+      level   INTEGER DEFAULT 1,
+      tags    TEXT DEFAULT '[]',
+      q       TEXT NOT NULL,
+      options TEXT DEFAULT '[]',
+      answer  TEXT NOT NULL,
+      explain TEXT DEFAULT ''
+    )
+  `)
+
+  // 学习记录（用户点亮的知识点）
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS kg_learn_records (
+      id         TEXT PRIMARY KEY,
+      userId     TEXT NOT NULL,
+      nodeId     TEXT NOT NULL,
+      firstTime  TEXT,
+      reviewTime TEXT,
+      UNIQUE(userId, nodeId)
+    )
+  `)
+
+  // 答题记录
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS kg_answer_records (
+      id         TEXT PRIMARY KEY,
+      userId     TEXT NOT NULL,
+      qid        TEXT NOT NULL,
+      userAnswer TEXT DEFAULT '',
+      correct    INTEGER DEFAULT 0,
+      time       TEXT
+    )
+  `)
+
+  // 错题本
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS kg_wrong_questions (
+      id      TEXT PRIMARY KEY,
+      userId  TEXT NOT NULL,
+      qid     TEXT NOT NULL,
+      addedAt TEXT,
+      removed INTEGER DEFAULT 0,
+      UNIQUE(userId, qid)
+    )
+  `)
+
+  // 收藏夹
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS kg_favorites (
+      id     TEXT PRIMARY KEY,
+      userId TEXT NOT NULL,
+      qid    TEXT NOT NULL,
+      time   TEXT,
+      UNIQUE(userId, qid)
+    )
+  `)
+
+  // 每日打卡
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS kg_checkins (
+      id     TEXT PRIMARY KEY,
+      userId TEXT NOT NULL,
+      date   TEXT NOT NULL,
+      UNIQUE(userId, date)
+    )
+  `)
+
+  // 成就记录
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS kg_achievements (
+      id     TEXT PRIMARY KEY,
+      userId TEXT NOT NULL,
+      achId  TEXT NOT NULL,
+      time   TEXT,
+      UNIQUE(userId, achId)
+    )
+  `)
+
+  // 经验值日志
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS kg_xp_logs (
+      id     TEXT PRIMARY KEY,
+      userId TEXT NOT NULL,
+      delta  INTEGER NOT NULL,
+      reason TEXT DEFAULT '',
+      time   TEXT
+    )
+  `)
+
+  // 专属面试题库（区别于 kg_questions 的基础题，hot 标记高频题）
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS kg_interview_questions (
+      id      TEXT PRIMARY KEY,
+      cat     TEXT NOT NULL,
+      type    TEXT DEFAULT 'single',
+      level   INTEGER DEFAULT 1,
+      hot     INTEGER DEFAULT 0,
+      tags    TEXT DEFAULT '[]',
+      q       TEXT NOT NULL,
+      options TEXT DEFAULT '[]',
+      answer  TEXT NOT NULL,
+      explain TEXT DEFAULT ''
+    )
+  `)
+
+  // 面试模拟考试记录
+  _db.run(`
+    CREATE TABLE IF NOT EXISTS kg_exams (
+      id        TEXT PRIMARY KEY,
+      userId    TEXT NOT NULL,
+      total     INTEGER DEFAULT 0,
+      correct   INTEGER DEFAULT 0,
+      rate      REAL DEFAULT 0,
+      detail    TEXT DEFAULT '[]',
+      time      TEXT
+    )
+  `)
+
+  // 常用查询索引
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_kg_nodes_cat ON kg_nodes(cat)`)
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_kg_questions_cat ON kg_questions(cat)`)
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_kg_questions_node ON kg_questions(node)`)
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_kg_learn_user ON kg_learn_records(userId)`)
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_kg_answer_user ON kg_answer_records(userId)`)
+  _db.run(`CREATE INDEX IF NOT EXISTS idx_kg_xp_user ON kg_xp_logs(userId)`)
 }
 
 // ==================== 持久化 ====================
@@ -781,6 +934,75 @@ export function isFamilyMember(familyId, userId) {
     [familyId, userId]
   )
   return !!row
+}
+
+/**
+ * 首次启动时自动导入前端知识图谱数据（知识点 + 题目）
+ * 数据源：data/knowledge-graph/index.js（14 个分类的静态内容）
+ * 仅在 kg_nodes 表为空时执行，避免重复导入
+ */
+async function seedKnowledgeGraph() {
+  try {
+    const existing = dbGet('SELECT COUNT(*) AS c FROM kg_nodes')
+    if (existing && existing.c > 0) {
+      console.log('[KG] 知识图谱数据已存在，跳过导入')
+      return
+    }
+
+    const mod = await import('../data/knowledge-graph/index.js')
+    const nodes = mod.ALL_NODES || []
+    const questions = mod.ALL_QUESTIONS || []
+
+    dbTransaction(() => {
+      for (const n of nodes) {
+        _db.run(
+          'INSERT INTO kg_nodes (id, cat, name, level, deps, content, sort) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          [n.id, n.cat, n.name, n.level || 1, JSON.stringify(n.deps || []), n.content || '', n.sort || 0]
+        )
+      }
+      for (const q of questions) {
+        _db.run(
+          'INSERT INTO kg_questions (id, cat, node, type, level, tags, q, options, answer, explain) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [q.id, q.cat, q.node || '', q.type || 'single', q.level || 1, JSON.stringify(q.tags || []), q.q, JSON.stringify(q.options || []), JSON.stringify(q.answer), q.explain || '']
+        )
+      }
+    })
+
+    console.log(`[KG] 知识图谱数据导入完成：${nodes.length} 个知识点，${questions.length} 道题`)
+  } catch (e) {
+    console.error('[KG] 知识图谱数据导入失败:', e.message)
+  }
+}
+
+/**
+ * 首次启动时自动导入专属面试题库
+ * 数据源：data/knowledge-graph/interview.js
+ * 仅在 kg_interview_questions 表为空时执行
+ */
+async function seedInterviewQuestions() {
+  try {
+    const existing = dbGet('SELECT COUNT(*) AS c FROM kg_interview_questions')
+    if (existing && existing.c > 0) {
+      console.log('[KG] 面试题库数据已存在，跳过导入')
+      return
+    }
+
+    const mod = await import('../data/knowledge-graph/interview.js')
+    const questions = mod.interviewQuestions || []
+
+    dbTransaction(() => {
+      for (const q of questions) {
+        _db.run(
+          'INSERT INTO kg_interview_questions (id, cat, type, level, hot, tags, q, options, answer, explain) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          [q.id, q.cat, q.type || 'single', q.level || 1, q.hot ? 1 : 0, JSON.stringify(q.tags || []), q.q, JSON.stringify(q.options || []), JSON.stringify(q.answer), q.explain || '']
+        )
+      }
+    })
+
+    console.log(`[KG] 面试题库导入完成：${questions.length} 道面试题`)
+  } catch (e) {
+    console.error('[KG] 面试题库导入失败:', e.message)
+  }
 }
 
 console.log('[DB] 模块已加载（需调用 initDatabase() 初始化）')
